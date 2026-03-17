@@ -1,0 +1,56 @@
+[project]
+name = "diffusion-renderer"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "accelerate==1.3.0",
+    "braceexpand>=0.1.7",
+    "datasets==2.19.0",
+    "diffusers==0.32.0",
+    "einops>=0.8.2",
+    "ffmpegcv>=0.3.18",
+    "huggingface-hub==0.25.0",
+    "imageio>=2.37.3",
+    "imageio-ffmpeg>=0.6.0",
+    "matplotlib>=3.10.8",
+    "mediapy>=1.2.6",
+    "ninja>=1.13.0",
+    "omegaconf>=2.3.0",
+    "opencv-python>=4.13.0.92",
+    "openexr>=3.4.7",
+    "peft==0.7.0",
+    "pillow>=10.3.0",
+    "scipy>=1.15.3",
+    "tensorboardx>=2.6.4",
+    "torch==2.4.1",
+    "torchaudio==2.4.1",
+    "tqdm>=4.67.3",
+    "transformers==4.47.1",
+    "vtk>=9.6.0",
+    "zprj-loader",
+]
+
+
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu124" , marker = "platform_system != 'Darwin'"}
+]
+
+torchvision = [
+    { index = "pytorch-cu124" , marker = "platform_system != 'Darwin'"}
+]
+
+torchaudio = [
+    { index = "pytorch-cu124" , marker = "platform_system != 'Darwin'"}
+]
+
+nvdiffrast = { git = "https://github.com/NVlabs/nvdiffrast.git", rev = "v0.3.3"}
+zprj-loader = { git = "https://github.com/clo3d/zprj_loader_python.git" }
