@@ -61,12 +61,17 @@ def _tex_to_tensor(data: bytes | None, ch: int = 3) -> torch.Tensor | None:
         return None
 
 
-def _apply_uv_transform(uvs: np.ndarray, mat) -> np.ndarray:
+def _apply_uv_transform(uvs: np.ndarray, mat, tex_scale: float | None = None) -> np.ndarray:
     result = uvs.copy()
-    tw = mat.tile_width if mat.tile_width > 0 else 1.0
-    th = mat.tile_height if mat.tile_height > 0 else 1.0
-    result[:, 0] /= tw
-    result[:, 1] /= th
+    if tex_scale is not None:
+        # Substance texture: use tex_scale (mm) as tile size
+        result[:, 0] /= tex_scale
+        result[:, 1] /= tex_scale
+    else:
+        tw = mat.tile_width if mat.tile_width > 0 else 1.0
+        th = mat.tile_height if mat.tile_height > 0 else 1.0
+        result[:, 0] /= tw
+        result[:, 1] /= th
     xf = mat.diffuse_texture_transform
     angle = getattr(xf, "rotation", 0.0)
     if angle:
@@ -111,7 +116,7 @@ def _find_substance_tex(image_cache, mat, kind, colorway_idx=None):
     return candidates[pick][1]
 
 
-def load_mesh(scene, image_cache, colorway_idx=None):
+def load_mesh(scene, image_cache, colorway_idx=None, tex_scale=None):
     materials = list(scene.fabric_materials)
 
     # Determine colorway index
@@ -124,7 +129,24 @@ def load_mesh(scene, image_cache, colorway_idx=None):
     all_bc, all_rough, all_metal = [], [], []
     voff = 0
     tex_bytes = {"diffuse": None, "normal": None, "roughness": None, "metallic": None}
+    has_substance = False
     normal_intensity = 1.0
+
+    # Resolve textures from first material
+    if materials:
+        mat0 = materials[0]
+        for kind, mat_path in [("diffuse", mat0.diffuse_texture_path),
+                               ("normal", mat0.normal_texture_path),
+                               ("roughness", mat0.roughness_texture_path),
+                               ("metallic", mat0.metalness_texture_path)]:
+            tex_bytes[kind] = _resolve_tex(mat_path, image_cache)
+            if tex_bytes[kind] is None:
+                sub_kind = "basecolor" if kind == "diffuse" else kind
+                tex_bytes[kind] = _find_substance_tex(image_cache, mat0, sub_kind, colorway_idx)
+                if tex_bytes[kind] is not None:
+                    has_substance = True
+        if tex_bytes["normal"]:
+            normal_intensity = mat0.normal_intensity_percent / 100.0 if mat0.normal_intensity_percent > 0 else 1.0
 
     for pat in scene.garment_patterns:
         nv, nf = pat.vertex_count, pat.triangle_count
@@ -141,27 +163,14 @@ def load_mesh(scene, image_cache, colorway_idx=None):
             mi = 0
         mat = materials[mi] if 0 <= mi < len(materials) else None
 
-        if mat and uv is not None:
-            uv = _apply_uv_transform(uv, mat)
-
         if mat:
             dc = np.array(mat.diffuse_color, dtype=np.float32)
             bc = np.tile(dc[:3], (nv, 1)) if dc.size >= 3 else np.ones((nv, 3), dtype=np.float32)
             ro = np.full(nv, mat.roughness if mat.use_metalness_roughness_pbr else 0.5, dtype=np.float32)
             me = np.full(nv, mat.metalness if mat.use_metalness_roughness_pbr else 0.0, dtype=np.float32)
 
-            # Resolve textures: try material path first, then substance DDS
-            for kind, mat_path in [("diffuse", mat.diffuse_texture_path),
-                                   ("normal", mat.normal_texture_path),
-                                   ("roughness", mat.roughness_texture_path),
-                                   ("metallic", mat.metalness_texture_path)]:
-                if tex_bytes[kind] is None:
-                    tex_bytes[kind] = _resolve_tex(mat_path, image_cache)
-                    if tex_bytes[kind] is None:
-                        sub_kind = "basecolor" if kind == "diffuse" else kind
-                        tex_bytes[kind] = _find_substance_tex(image_cache, mat, sub_kind, colorway_idx)
-            if tex_bytes["normal"]:
-                normal_intensity = mat.normal_intensity_percent / 100.0 if mat.normal_intensity_percent > 0 else 1.0
+            if uv is not None:
+                uv = _apply_uv_transform(uv, mat, tex_scale=tex_scale if has_substance else None)
         else:
             bc = np.full((nv, 3), 0.5, dtype=np.float32)
             ro = np.full(nv, 0.5, dtype=np.float32)
@@ -469,10 +478,12 @@ def main():
     parser.add_argument("--fov", type=float, default=15.0, help="Camera FOV in degrees")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--colorway", type=int, default=None, help="Colorway index (default: active colorway)")
+    parser.add_argument("--tex-scale", type=float, default=10.0, help="Substance texture tile size in mm (default: 10)")
     parser.add_argument("--gbuffer-only", action="store_true", help="Only render G-buffers, skip forward rendering")
     parser.add_argument("--mode", choices=["still", "turntable", "rotate-light"], default="still",
                         help="still: single image | turntable: camera orbits 360° | rotate-light: light rotates 360°")
     parser.add_argument("--fps", type=int, default=10, help="Video FPS")
+    parser.add_argument("--gif", action="store_true", help="Save as GIF instead of MP4 (turntable/rotate-light)")
     args = parser.parse_args()
 
     import zprj_loader
@@ -488,7 +499,7 @@ def main():
         print(f"Error: {scene.error}")
         return
     image_cache = load_images_from_zprj(os.path.abspath(args.input))
-    mesh = load_mesh(scene, image_cache, colorway_idx=args.colorway)
+    mesh = load_mesh(scene, image_cache, colorway_idx=args.colorway, tex_scale=args.tex_scale)
     print(f"Mesh: {mesh['positions'].shape[0]} verts, {mesh['faces'].shape[0]} tris")
 
     # 2. Render G-buffers
@@ -519,13 +530,22 @@ def main():
         rotate_light=(args.mode == "rotate-light"),
     )
 
-    frames[0].save(os.path.join(out_dir, "rendered.png"))
-    if args.mode != "still":
-        video_path = os.path.join(out_dir, f"{args.mode}.mp4")
-        save_video(frames, video_path, fps=args.fps)
-        print(f"Video saved to {video_path}")
+    hdr_stem = os.path.splitext(os.path.basename(args.hdr))[0]
+    if args.mode == "still":
+        out_path = os.path.join(out_dir, f"rendered_{hdr_stem}.png")
+        frames[0].save(out_path)
+        print(f"Rendered image saved to {out_path}")
     else:
-        print(f"Rendered image saved to {os.path.join(out_dir, 'rendered.png')}")
+        frames[0].save(os.path.join(out_dir, f"rendered_{hdr_stem}.png"))
+        if args.gif:
+            gif_path = os.path.join(out_dir, f"{args.mode}_{hdr_stem}.gif")
+            frames[0].save(gif_path, save_all=True, append_images=frames[1:],
+                           duration=1000 // args.fps, loop=0)
+            print(f"GIF saved to {gif_path}")
+        else:
+            video_path = os.path.join(out_dir, f"{args.mode}_{hdr_stem}.mp4")
+            save_video(frames, video_path, fps=args.fps)
+            print(f"Video saved to {video_path}")
 
 
 if __name__ == "__main__":

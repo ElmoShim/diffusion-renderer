@@ -2,7 +2,7 @@
 
 Render CLO3D garment files (`.zprj`) into photorealistic images using [DiffusionRenderer](https://arxiv.org/abs/2501.18590).
 
-![pipeline](asset/pipeline_diagram.png)
+![pipeline](asset/pipeline_diagram.gif)
 
 `.zprj` 파일에서 G-buffer(basecolor, normal, depth, roughness, metallic)를 추출한 뒤, diffusion forward renderer로 조명이 적용된 이미지를 생성합니다.
 
