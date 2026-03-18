@@ -17,12 +17,14 @@ dependencies = [
     "matplotlib>=3.10.8",
     "mediapy>=1.2.6",
     "ninja>=1.13.0",
+    "nvdiffrast>=0.3.3",
     "omegaconf>=2.3.0",
     "opencv-python>=4.13.0.92",
     "openexr>=3.4.7",
     "peft==0.7.0",
     "pillow>=10.3.0",
     "scipy>=1.15.3",
+    "setuptools>=82.0.1",
     "tensorboardx>=2.6.4",
     "torch==2.4.1",
     "torchaudio==2.4.1",
@@ -53,4 +55,4 @@ torchaudio = [
 ]
 
 nvdiffrast = { git = "https://github.com/NVlabs/nvdiffrast.git", rev = "v0.3.3"}
-zprj-loader = { git = "https://github.com/clo3d/zprj_loader_python.git" }
+zprj-loader = { git = "https://github.com/clo3d/zprj_loader_python.git", rev="v0.2.0"}

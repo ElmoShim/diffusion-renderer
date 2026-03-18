@@ -602,6 +602,7 @@ dependencies = [
     { name = "matplotlib" },
     { name = "mediapy" },
     { name = "ninja" },
+    { name = "nvdiffrast" },
     { name = "omegaconf" },
     { name = "opencv-python" },
     { name = "openexr" },
@@ -609,6 +610,7 @@ dependencies = [
     { name = "pillow" },
     { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "setuptools" },
     { name = "tensorboardx" },
     { name = "torch", version = "2.4.1", source = { registry = "https://download.pytorch.org/whl/cu124" }, marker = "python_full_version < '3.13' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux'" },
     { name = "torch", version = "2.4.1", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin'" },
@@ -635,12 +637,14 @@ requires-dist = [
     { name = "matplotlib", specifier = ">=3.10.8" },
     { name = "mediapy", specifier = ">=1.2.6" },
     { name = "ninja", specifier = ">=1.13.0" },
+    { name = "nvdiffrast", git = "https://github.com/NVlabs/nvdiffrast.git?rev=v0.3.3" },
     { name = "omegaconf", specifier = ">=2.3.0" },
     { name = "opencv-python", specifier = ">=4.13.0.92" },
     { name = "openexr", specifier = ">=3.4.7" },
     { name = "peft", specifier = "==0.7.0" },
     { name = "pillow", specifier = ">=10.3.0" },
     { name = "scipy", specifier = ">=1.15.3" },
+    { name = "setuptools", specifier = ">=82.0.1" },
     { name = "tensorboardx", specifier = ">=2.6.4" },
     { name = "torch", marker = "sys_platform != 'darwin'", specifier = "==2.4.1", index = "https://download.pytorch.org/whl/cu124" },
     { name = "torch", marker = "sys_platform == 'darwin'", specifier = "==2.4.1" },
@@ -649,7 +653,7 @@ requires-dist = [
     { name = "tqdm", specifier = ">=4.67.3" },
     { name = "transformers", specifier = "==4.47.1" },
     { name = "vtk", specifier = ">=9.6.0" },
-    { name = "zprj-loader", git = "https://github.com/clo3d/zprj_loader_python.git" },
+    { name = "zprj-loader", git = "https://github.com/clo3d/zprj_loader_python.git?rev=v0.2.0" },
 ]
 
 [[package]]
@@ -1803,6 +1807,15 @@ wheels = [
 ]
 
 [[package]]
+name = "nvdiffrast"
+version = "0.3.3"
+source = { git = "https://github.com/NVlabs/nvdiffrast.git?rev=v0.3.3#729261dc64c4241ea36efda84fbf532cc8b425b8" }
+dependencies = [
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.4.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+]
+
+[[package]]
 name = "nvidia-cublas-cu12"
 version = "12.4.2.65"
 source = { registry = "https://pypi.org/simple" }
@@ -2946,6 +2959,15 @@ wheels = [
 ]
 
 [[package]]
+name = "setuptools"
+version = "82.0.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/4f/db/cfac1baf10650ab4d1c111714410d2fbb77ac5a616db26775db562c8fab2/setuptools-82.0.1.tar.gz", hash = "sha256:7d872682c5d01cfde07da7bccc7b65469d3dca203318515ada1de5eda35efbf9", size = 1152316, upload-time = "2026-03-09T12:47:17.221Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/9d/76/f789f7a86709c6b087c5a2f52f911838cad707cc613162401badc665acfe/setuptools-82.0.1-py3-none-any.whl", hash = "sha256:a59e362652f08dcd477c78bb6e7bd9d80a7995bc73ce773050228a348ce2e5bb", size = 1006223, upload-time = "2026-03-09T12:47:15.026Z" },
+]
+
+[[package]]
 name = "six"
 version = "1.17.0"
 source = { registry = "https://pypi.org/simple" }
@@ -3565,8 +3587,8 @@ wheels = [
 
 [[package]]
 name = "zprj-loader"
-version = "0.1.1"
-source = { git = "https://github.com/clo3d/zprj_loader_python.git#a5d658a99515a5dc6630c83d56399f88c9a94c0c" }
+version = "0.2.0"
+source = { git = "https://github.com/clo3d/zprj_loader_python.git?rev=v0.2.0#0be52d213fe26c6f6c37b9e5c52eae74b53b4865" }
 dependencies = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },

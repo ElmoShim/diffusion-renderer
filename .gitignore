@@ -6,3 +6,4 @@ examples/.DS_Store
 
 *.pyc
 tmp/
+*.zprj

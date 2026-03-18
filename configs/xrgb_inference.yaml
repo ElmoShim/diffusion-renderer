@@ -17,7 +17,7 @@ inference_max_guidance_scale: 1.2
 model_dtype: fp16
 decode_chunk_size: 8
 cond_mode: 'env' # clip branch for cross attention
-lora_scale: 0.25
+lora_scale: 0.5
 model_pipeline:
   cond_mode: 'env' # clipimage for cross attention
   target_image: 'rgb'
