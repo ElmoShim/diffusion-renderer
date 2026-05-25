@@ -8,6 +8,7 @@
 
 import os
 os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '1'
+os.environ.setdefault('TORCH_EXTENSIONS_DIR', os.path.join(os.path.dirname(__file__), '..', '..', '.venv', 'torch_extensions'))
 import cv2
 import imageio.v3 as imageio
 import numpy as np

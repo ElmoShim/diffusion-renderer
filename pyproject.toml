@@ -26,8 +26,7 @@ dependencies = [
     "scipy>=1.15.3",
     "setuptools>=82.0.1",
     "tensorboardx>=2.6.4",
-    "torch==2.4.1",
-    "torchaudio==2.4.1",
+    "torch==2.9.0",
     "tqdm>=4.67.3",
     "transformers==4.47.1",
     "vtk>=9.6.0",
@@ -35,24 +34,31 @@ dependencies = [
 ]
 
 
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [[tool.uv.index]]
-name = "pytorch-cu124"
-url = "https://download.pytorch.org/whl/cu124"
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [tool.uv.sources]
 torch = [
-    { index = "pytorch-cu124" , marker = "platform_system != 'Darwin'"}
+    { index = "pytorch-cpu", marker = "platform_system == 'Darwin'"},
+    { index = "pytorch-cu128" , marker = "platform_system != 'Darwin'"}
 ]
 
 torchvision = [
-    { index = "pytorch-cu124" , marker = "platform_system != 'Darwin'"}
+    { index = "pytorch-cpu", marker = "platform_system == 'Darwin'"},
+    { index = "pytorch-cu128" , marker = "platform_system != 'Darwin'"}
 ]
 
 torchaudio = [
-    { index = "pytorch-cu124" , marker = "platform_system != 'Darwin'"}
+    { index = "pytorch-cpu", marker = "platform_system == 'Darwin'"},
+    { index = "pytorch-cu128" , marker = "platform_system != 'Darwin'"}
 ]
 
-nvdiffrast = { git = "https://github.com/NVlabs/nvdiffrast.git", rev = "v0.3.3"}
+nvdiffrast = { git = "https://github.com/NVlabs/nvdiffrast.git", rev = "abb07ca"}
 zprj-loader = { git = "https://github.com/clo3d/zprj_loader_python.git", rev="v0.2.0"}

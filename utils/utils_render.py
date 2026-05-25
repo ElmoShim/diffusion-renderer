@@ -6,6 +6,7 @@ import os
 
 import numpy as np
 import torch
+os.environ.setdefault('TORCH_EXTENSIONS_DIR', os.path.join(os.path.dirname(__file__), '..', '.venv', 'torch_extensions'))
 import nvdiffrast.torch as dr
 from PIL import Image
 

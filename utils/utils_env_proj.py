@@ -14,7 +14,7 @@ import imageio
 import imageio.v3 as imageio_v3
 import numpy as np
 import torch
-
+os.environ.setdefault('TORCH_EXTENSIONS_DIR', os.path.join(os.path.dirname(__file__), '..', '.venv', 'torch_extensions'))
 import nvdiffrast.torch as dr
 import src.data.rendering_utils as util
 

@@ -163,7 +163,7 @@ def main():
     parser = argparse.ArgumentParser(description="Render a .zprj garment with the diffusion renderer.")
     parser.add_argument("input", type=str, help="Path to .zprj file")
     parser.add_argument("--hdr", type=str, default="examples/hdri/sunny_vondelpark_1k.hdr", help="HDR environment map")
-    parser.add_argument("--output", type=str, default=None, help="Output directory (default: tmp/<stem>/)")
+    parser.add_argument("--output", type=str, default="output", help="Output directory (default: tmp/<stem>/)")
     parser.add_argument("--resolution", type=int, default=512, help="Render resolution")
     parser.add_argument("--fov", type=float, default=15.0, help="Camera FOV in degrees")
     parser.add_argument("--device", type=str, default="cuda")
@@ -177,7 +177,7 @@ def main():
     import zprj_loader
 
     stem = os.path.splitext(os.path.basename(args.input))[0]
-    out_dir = args.output or f"tmp/{stem}/"
+    out_dir =  f"{args.output}/{stem}/"
     os.makedirs(out_dir, exist_ok=True)
 
     # 1. Load zprj
