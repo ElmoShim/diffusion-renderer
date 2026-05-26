@@ -227,7 +227,8 @@ class CosmosRendererBase(torch.nn.Module):
         self.scheduler.set_timesteps(num_steps)
         xt = torch.randn(state_shape, generator=torch.Generator("cpu").manual_seed(seed)).to(**self.tensor_kwargs) * self.scheduler.init_noise_sigma
 
-        for t in self.scheduler.timesteps:
+        from tqdm import tqdm
+        for t in tqdm(self.scheduler.timesteps, desc="Denoising", leave=False):
             xt = xt.to(**self.tensor_kwargs)
             xt_scaled = self.scheduler.scale_model_input(xt, timestep=t)
             t_dev = t.to(**self.tensor_kwargs)

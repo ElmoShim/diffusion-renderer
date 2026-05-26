@@ -238,7 +238,7 @@ def assemble_mesh(collector, textures, normal_intensity=1.0, garment_face_count=
 
 # ── Mesh loading ──────────────────────────────────────────────────────
 
-def load_mesh(scene):
+def load_mesh(scene, background=True):
     """Load all scene meshes (garment, avatar, trim, button, zipper) with PBR materials.
 
     Uses zprj_loader v0.2.0 API (scene.read_file()) for embedded texture access.
@@ -441,13 +441,16 @@ def load_mesh(scene):
     # ── 6. Background cylinder ──────────────────────────────────────
     orig_pos = np.concatenate(col["pos"])
     orig_bbox = (orig_pos.min(0), orig_pos.max(0))
-    _add_background_cylinder(col)
+    orig_face_count = sum(f.shape[0] for f in col["faces"])
+    if background:
+        _add_background_cylinder(col)
 
     # ── Assemble ─────────────────────────────────────────────────────
     textures = {k: tex_to_tensor(v, 3 if k not in ("roughness", "metallic") else 1)
                 for k, v in tex_bytes.items()}
     m = assemble_mesh(col, textures, normal_intensity, garment_face_count)
     m["orig_bbox"] = orig_bbox
+    m["orig_face_count"] = orig_face_count
     return m
 
 
@@ -642,15 +645,21 @@ def render_gbuffers(mesh, resolution=512, fov_deg=20.0, azimuth_deg=0.0, device=
     ni_view[..., 1] = -ni_view[..., 1]
     gb["normal"] = ((ni_view * 0.5 + 0.5) * mask)[0]
 
-    # Depth
+    # Depth (exclude background faces)
+    orig_fc = mesh.get("orig_face_count")
+    if orig_fc is not None:
+        tri_id = rast[..., 3:4]
+        fg_mask = ((tri_id > 0) & (tri_id <= orig_fc)).float()
+    else:
+        fg_mask = mask
     cam_z = -(pos_h @ view_t.T)[:, 2:3]
     cz, _ = dr.interpolate(cam_z[None, ...], rast, tri)
-    valid = cz[mask.bool().expand_as(cz)]
+    valid = cz[fg_mask.bool().expand_as(cz)]
     if valid.numel() > 0:
         dn = (cz - valid.min()) / (valid.max() - valid.min() + 1e-8)
     else:
         dn = cz
-    gb["depth"] = (dn.clamp(0, 1) * mask + (1 - mask)).expand(-1, -1, -1, 3)[0]
+    gb["depth"] = (dn.clamp(0, 1) * fg_mask + (1 - fg_mask)).expand(-1, -1, -1, 3)[0]
 
     # Basecolor, Roughness, Metallic
     gb["basecolor"] = _sample_or_interp(textures["diffuse"], bc_t, uv_s, rast, tri, mask, device, tex_mask)[0]
