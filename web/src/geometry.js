@@ -4,6 +4,44 @@ import vtkDataArray from '@kitware/vtk.js/Common/Core/DataArray';
 import vtkTexture from '@kitware/vtk.js/Rendering/Core/Texture';
 import vtkPolyDataNormals from '@kitware/vtk.js/Filters/Core/PolyDataNormals';
 
+function isIdentity(m) {
+  if (!m || m.length !== 16) return true;
+  for (let i = 0; i < 4; i++)
+    for (let j = 0; j < 4; j++)
+      if (Math.abs(m[i * 4 + j] - (i === j ? 1 : 0)) > 1e-6) return false;
+  return true;
+}
+
+function applyMatrix(polyData, m) {
+  const pts = polyData.getPoints().getData();
+  const nv = pts.length / 3;
+  const out = new Float32Array(pts.length);
+  for (let i = 0; i < nv; i++) {
+    const x = pts[i * 3], y = pts[i * 3 + 1], z = pts[i * 3 + 2];
+    out[i * 3]     = m[0] * x + m[4] * y + m[8]  * z + m[12];
+    out[i * 3 + 1] = m[1] * x + m[5] * y + m[9]  * z + m[13];
+    out[i * 3 + 2] = m[2] * x + m[6] * y + m[10] * z + m[14];
+  }
+  polyData.getPoints().setData(out, 3);
+
+  const nArr = polyData.getPointData().getNormals();
+  if (nArr) {
+    const nd = nArr.getData();
+    const nout = new Float32Array(nd.length);
+    for (let i = 0; i < nv; i++) {
+      const nx = nd[i * 3], ny = nd[i * 3 + 1], nz = nd[i * 3 + 2];
+      let rx = m[0] * nx + m[4] * ny + m[8]  * nz;
+      let ry = m[1] * nx + m[5] * ny + m[9]  * nz;
+      let rz = m[2] * nx + m[6] * ny + m[10] * nz;
+      const len = Math.sqrt(rx * rx + ry * ry + rz * rz) || 1;
+      nout[i * 3] = rx / len;
+      nout[i * 3 + 1] = ry / len;
+      nout[i * 3 + 2] = rz / len;
+    }
+    nArr.setData(nout);
+  }
+}
+
 export function makePolyData(positions, indices, vertexCount, triangleCount, normals) {
   const polyData = vtkPolyData.newInstance();
   polyData.getPoints().setData(new Float32Array(positions), 3);
@@ -151,33 +189,34 @@ export async function buildSceneActors(scene) {
     let diffuseTex = null;
     let roughnessTex = null;
 
-    if (mat) {
+    if (mat && pattern.uvVertexCount === pattern.vertexCount) {
       const texPath = mat.diffuseTexturePath || null;
-      if (texPath && pattern.uvVertexCount === pattern.vertexCount) {
+      if (texPath) {
         if (!texCache.has(texPath)) {
           texCache.set(texPath, await loadTextureFromScene(scene, texPath));
         }
         diffuseTex = texCache.get(texPath);
-        if (diffuseTex) {
-          const uvs = pattern.getUVs();
-          setTexCoords(polyData, uvs, pattern.vertexCount, mat.tileWidth, mat.tileHeight, mat.diffuseTextureTransform);
-        }
       }
 
       const roughPath = mat.roughnessTexturePath || null;
-      if (roughPath && pattern.uvVertexCount === pattern.vertexCount) {
+      if (roughPath) {
         const rKey = 'rough:' + roughPath;
         if (!texCache.has(rKey)) {
           texCache.set(rKey, await loadTextureFromScene(scene, roughPath));
         }
         roughnessTex = texCache.get(rKey);
       }
+
+      if (diffuseTex || roughnessTex) {
+        const uvs = pattern.getUVs();
+        setTexCoords(polyData, uvs, pattern.vertexCount, mat.tileWidth, mat.tileHeight, mat.diffuseTextureTransform);
+      }
     }
 
     const baseColor = mat ? normalizeColor(mat.getBaseColor()) : [0.8, 0.8, 0.8];
-    const roughness = mat?.roughness ?? 0.5;
-    const metallic = mat?.metalness ?? 0.0;
-
+    const isPBR = mat?.useMetalnessRoughnessPBR ?? false;
+    const roughness = isPBR ? (mat.roughness ?? 0.5) : 0.5;
+    const metallic = isPBR ? (mat.metalness ?? 0.0) : 0.0;
     actors.push({
       polyData, diffuseColor: baseColor, roughness, metallic,
       diffuseTex, roughnessTex, type: 'garment',
@@ -207,6 +246,11 @@ export async function buildSceneActors(scene) {
     const indices = mesh.getIndices();
     const normals = mesh.getNormals();
     const polyData = makePolyData(positions, indices, mesh.vertexCount, mesh.triangleCount, normals);
+
+    try {
+      const wm = mesh.getWorldMatrix();
+      if (!isIdentity(wm)) applyMatrix(polyData, wm);
+    } catch { /* no transform */ }
 
     let diffuseTex = null;
     if (mat && mat.diffuseTexturePath && mesh.uvVertexCount === mesh.vertexCount) {
@@ -243,6 +287,11 @@ export async function buildSceneActors(scene) {
     const indices = trim.getMeshIndices();
     const normals = trim.getMeshNormals();
     const polyData = makePolyData(positions, indices, trim.meshVertexCount, trim.meshTriangleCount, normals);
+
+    try {
+      const tm = trim.getTransformMatrix();
+      if (!isIdentity(tm)) applyMatrix(polyData, tm);
+    } catch { /* no transform */ }
 
     actors.push({
       polyData, diffuseColor: [0.6, 0.6, 0.7], roughness: 0.5, metallic: 0.0,

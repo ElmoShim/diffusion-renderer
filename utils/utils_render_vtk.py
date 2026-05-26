@@ -244,8 +244,8 @@ def _get_pattern_material(scene, pattern_index):
     return None
 
 
-def _build_background_cylinder(actors_data, n_seg=64, fov_deg=15.0):
-    """Add a closed cylinder (wall + floor + ceiling) enclosing all existing actors."""
+def _build_floor_disc(actors_data, n_seg=64, fov_deg=15.0):
+    """Add a floor disc at the bottom of the scene."""
     all_bounds = [ad["polydata"].GetBounds() for ad in actors_data]
     xmin = min(b[0] for b in all_bounds)
     xmax = max(b[1] for b in all_bounds)
@@ -258,56 +258,29 @@ def _build_background_cylinder(actors_data, n_seg=64, fov_deg=15.0):
     cz = (zmin + zmax) / 2
     height = ymax - ymin
     span_x = xmax - xmin
+    span_z = zmax - zmin
+    max_span = max(span_x, span_z)
 
     half_fov = math.radians(fov_deg) / 2.0
-    cam_dist = max(height / 2.0 / math.tan(half_fov),
-                   span_x / 2.0 / math.tan(half_fov)) * 1.05
-    radius = cam_dist * 1.1
-    y_floor = ymin
-    y_top = ymax + height * 0.6
+    radius = (max_span / 2.0 / math.tan(half_fov)) * 1.1
 
     angles = np.linspace(0, 2 * np.pi, n_seg, endpoint=False, dtype=np.float32)
     cos_a, sin_a = np.cos(angles), np.sin(angles)
 
-    bg_entry = {
-        "material": None, "has_tcoords": False,
-        "diffuse_color": (0.5, 0.5, 0.5), "roughness": 0.5, "metallic": 0.0,
-        "type": "background",
-    }
-
-    # Wall
-    wall_bot = np.stack([cx + radius * cos_a, np.full(n_seg, y_floor), cz + radius * sin_a], axis=1)
-    wall_top = np.stack([cx + radius * cos_a, np.full(n_seg, y_top), cz + radius * sin_a], axis=1)
-    wall_v = np.concatenate([wall_bot, wall_top]).astype(np.float32)
-    wall_f = []
-    for i in range(n_seg):
-        j = (i + 1) % n_seg
-        wall_f.append([i, j, j + n_seg])
-        wall_f.append([i, j + n_seg, i + n_seg])
-    wall_f = np.array(wall_f, np.int32)
-    actors_data.append({**bg_entry, "polydata": _make_polydata(wall_v, wall_f)})
-
-    # Floor disc
-    floor_center = np.array([[cx, y_floor, cz]], np.float32)
-    floor_ring = np.stack([cx + radius * cos_a, np.full(n_seg, y_floor), cz + radius * sin_a], axis=1)
+    floor_center = np.array([[cx, ymin, cz]], np.float32)
+    floor_ring = np.stack([cx + radius * cos_a, np.full(n_seg, ymin), cz + radius * sin_a], axis=1)
     floor_v = np.concatenate([floor_center, floor_ring]).astype(np.float32)
     floor_f = []
     for i in range(n_seg):
         j = (i + 1) % n_seg
         floor_f.append([0, j + 1, i + 1])
     floor_f = np.array(floor_f, np.int32)
-    actors_data.append({**bg_entry, "polydata": _make_polydata(floor_v, floor_f)})
-
-    # Ceiling disc
-    ceil_center = np.array([[cx, y_top, cz]], np.float32)
-    ceil_ring = np.stack([cx + radius * cos_a, np.full(n_seg, y_top), cz + radius * sin_a], axis=1)
-    ceil_v = np.concatenate([ceil_center, ceil_ring]).astype(np.float32)
-    ceil_f = []
-    for i in range(n_seg):
-        j = (i + 1) % n_seg
-        ceil_f.append([0, j + 1, i + 1])
-    ceil_f = np.array(ceil_f, np.int32)
-    actors_data.append({**bg_entry, "polydata": _make_polydata(ceil_v, ceil_f)})
+    actors_data.append({
+        "material": None, "has_tcoords": False,
+        "diffuse_color": (0.5, 0.5, 0.5), "roughness": 0.5, "metallic": 0.0,
+        "type": "background",
+        "polydata": _make_polydata(floor_v, floor_f),
+    })
 
 
 def build_scene_actors(scene, background=True):
@@ -463,7 +436,7 @@ def build_scene_actors(scene, background=True):
         })
 
     if background and actors_data:
-        _build_background_cylinder(actors_data)
+        _build_floor_disc(actors_data)
 
     return actors_data
 
@@ -540,7 +513,7 @@ def render_gbuffers(scene, resolution=512, fov_deg=20.0, azimuth_deg=0.0,
         azimuth_deg: camera azimuth angle.
         device: torch device for output tensors.
         _actors_data: pre-built actor data (for multi-frame reuse).
-        background: if True, include background cylinder (ignored if _actors_data given).
+        background: if True, include floor disc (ignored if _actors_data given).
 
     Returns:
         dict of {name: (H, W, 3) float32 torch.Tensor in [0, 1]}.
@@ -560,7 +533,6 @@ def render_gbuffers(scene, resolution=512, fov_deg=20.0, azimuth_deg=0.0,
     win.SetOffScreenRendering(True)
 
     ren = vtk.vtkRenderer()
-    ren.SetBackground(0, 0, 0)
     win.AddRenderer(ren)
 
     _setup_camera(ren, actors_data, fov_deg, azimuth_deg, aspect)
@@ -572,6 +544,7 @@ def render_gbuffers(scene, resolution=512, fov_deg=20.0, azimuth_deg=0.0,
         return torch.from_numpy(arr_uint8.astype(np.float32) / 255.0).to(device)
 
     # --- Basecolor (texture-mapped, unlit) ---
+    ren.SetBackground(0.5, 0.5, 0.5)
     ren.RemoveAllViewProps()
     for ad in actors_data:
         mapper = vtk.vtkPolyDataMapper()
@@ -595,6 +568,8 @@ def render_gbuffers(scene, resolution=512, fov_deg=20.0, azimuth_deg=0.0,
     gb["basecolor"] = _to_tensor(_capture_rgb(win))
 
     # --- Normal (custom shader) ---
+    # Background (0.5, 0.5, 1.0) = camera-facing normal in view space
+    ren.SetBackground(0.5, 0.5, 1.0)
     normal_sp = vtk.vtkShaderProperty()
     normal_sp.SetVertexShaderCode(NORMAL_VERT)
     normal_sp.SetFragmentShaderCode(NORMAL_FRAG)
@@ -608,20 +583,8 @@ def render_gbuffers(scene, resolution=512, fov_deg=20.0, azimuth_deg=0.0,
         ren.AddActor(actor)
     gb["normal"] = _to_tensor(_capture_rgb(win))
 
-    # --- Depth (from Z-buffer, foreground-normalized) ---
-    # Render foreground-only to get depth range excluding background cylinder
-    fg_actors = [ad for ad in actors_data if ad["type"] != "background"]
-    ren.RemoveAllViewProps()
-    for ad in fg_actors:
-        mapper = vtk.vtkPolyDataMapper()
-        mapper.SetInputData(ad["polydata"])
-        actor = vtk.vtkActor()
-        actor.SetMapper(mapper)
-        ren.AddActor(actor)
-    fg_zbuf = _capture_zbuffer(win)
-    fg_valid = fg_zbuf[fg_zbuf < 1.0 - 1e-6]
-
-    # Render full scene (with background) for final depth
+    # --- Depth (from Z-buffer) ---
+    ren.SetBackground(1, 1, 1)
     ren.RemoveAllViewProps()
     for ad in actors_data:
         mapper = vtk.vtkPolyDataMapper()
@@ -630,18 +593,18 @@ def render_gbuffers(scene, resolution=512, fov_deg=20.0, azimuth_deg=0.0,
         actor.SetMapper(mapper)
         ren.AddActor(actor)
     zbuf = _capture_zbuffer(win)
-    bg_mask = zbuf >= 1.0 - 1e-6
-
-    if fg_valid.size > 0:
-        depth_norm = (zbuf - fg_valid.min()) / (fg_valid.max() - fg_valid.min() + 1e-8)
+    valid = zbuf[zbuf < 1.0 - 1e-6]
+    if valid.size > 0:
+        depth_norm = (zbuf - valid.min()) / (valid.max() - valid.min() + 1e-8)
     else:
         depth_norm = zbuf.copy()
     depth_norm = np.clip(depth_norm, 0, 1)
-    depth_norm[bg_mask] = 1.0
+    depth_norm[zbuf >= 1.0 - 1e-6] = 1.0
     depth_rgb = np.stack([depth_norm] * 3, axis=-1).astype(np.float32)
     gb["depth"] = torch.from_numpy(depth_rgb).to(device)
 
     # --- Roughness (texture or uniform, unlit) ---
+    ren.SetBackground(0.5, 0.5, 0.5)
     ren.RemoveAllViewProps()
     for ad in actors_data:
         mapper = vtk.vtkPolyDataMapper()
@@ -667,6 +630,7 @@ def render_gbuffers(scene, resolution=512, fov_deg=20.0, azimuth_deg=0.0,
     gb["roughness"] = _to_tensor(_capture_rgb(win))
 
     # --- Metallic (texture or uniform, unlit) ---
+    ren.SetBackground(0, 0, 0)
     ren.RemoveAllViewProps()
     for ad in actors_data:
         mapper = vtk.vtkPolyDataMapper()
