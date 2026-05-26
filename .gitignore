@@ -8,3 +8,5 @@ examples/.DS_Store
 tmp/
 *.zprj
 output/
+web/node_modules/
+web/dist/
