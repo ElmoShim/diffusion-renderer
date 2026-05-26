@@ -12,8 +12,11 @@ Render CLO3D garment files (`.zprj`) into photorealistic images using [Diffusion
 # Python 3.10+, CUDA required
 uv sync
 
-# Download model weights
-uv run utils/download_weights.py --repo_id nexuslrf/diffusion_renderer-forward-svd
+# HuggingFace 로그인 (토큰 필요: https://huggingface.co/settings/tokens)
+huggingface-cli login
+
+# Download model weights (forward renderer + tokenizer)
+uv run utils/download_weights.py
 ```
 
 ## Usage
@@ -47,7 +50,7 @@ uv run render_zprj.py samples/garment.zprj --gbuffer-only
 | `--output` | `tmp/<filename>/` | 출력 디렉토리 |
 | `--mode` | `still` | `still` / `turntable` / `rotate-light` |
 | `--colorway` | active colorway | 컬러웨이 인덱스 |
-| `--resolution` | `512` | 렌더 해상도 |
+| `--resolution` | `704 1280` | 렌더 해상도 (H W) |
 | `--fov` | `15.0` | 카메라 FOV (degrees) |
 | `--gbuffer-only` | `false` | G-buffer만 저장, forward rendering 생략 |
 | `--fps` | `10` | 영상 FPS (`turntable`, `rotate-light` 모드) |
@@ -69,7 +72,7 @@ tmp/<filename>/
 ## Architecture
 
 - **G-buffer rendering**: [nvdiffrast](https://github.com/NVlabs/nvdiffrast) GPU rasterizer로 `.zprj` 메시에서 G-buffer 추출
-- **Forward rendering**: [DiffusionRenderer](https://arxiv.org/abs/2501.18590) (Stable Video Diffusion 기반) forward model로 G-buffer + HDR envmap → photorealistic image 생성
+- **Forward rendering**: [DiffusionRenderer](https://arxiv.org/abs/2501.18590) ([Cosmos Transfer1](https://github.com/nv-tlabs/cosmos-transfer1-diffusion-renderer) 7B FADiT 기반) forward model로 G-buffer + HDR envmap → photorealistic image 생성
 - **zprj parsing**: [zprj_loader](https://github.com/clo3d/zprj_loader_python) 라이브러리로 CLO3D 파일에서 메시, 재질, 텍스처 추출
 
 ### Supported material features

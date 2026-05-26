@@ -9,15 +9,45 @@ Usage:
 
 import argparse
 import os
-from contextlib import nullcontext
 
-import numpy as np
 import torch
 
 from utils.utils_render import (
     load_mesh, render_gbuffers, precompute_mesh_gpu,
     save_tensor_as_png, save_video,
 )
+
+
+_model_cache = None
+
+
+def _load_model(cfg, device="cuda"):
+    global _model_cache
+    if _model_cache is not None:
+        return _model_cache
+
+    from src.cosmos.model import CosmosForwardRenderer
+
+    model = CosmosForwardRenderer(
+        condition_keys=list(cfg.condition_keys),
+        condition_drop_rate=0,
+        append_condition_mask=cfg.append_condition_mask,
+        num_frames=cfg.inference_n_frames,
+        height=cfg.inference_res[0],
+        width=cfg.inference_res[1],
+    )
+    model.build_network()
+
+    ckpt_path = os.path.join(cfg.checkpoint_dir, cfg.model_checkpoint)
+    model.load_checkpoint(ckpt_path)
+
+    tokenizer_dir = os.path.join(cfg.checkpoint_dir, cfg.tokenizer_dir)
+    model.load_tokenizer(tokenizer_dir)
+
+    model.to_device()
+    model.eval()
+    _model_cache = model
+    return model
 
 
 # ── forward rendering ────────────────────────────────────────────────
@@ -27,9 +57,9 @@ def forward_render(gbuffers_list, hdr_path, device="cuda", rotate_light=False,
     """Run diffusion forward rendering.
 
     Args:
-        gbuffers_list: single dict {name: (H,W,3)} or list of 24 dicts for multi-frame.
+        gbuffers_list: single dict {name: (H,W,3)} or list of dicts for multi-frame.
         hdr_path: path to HDR environment map.
-        rotate_light: if True, rotate environment light 360 degrees over 24 frames.
+        rotate_light: if True, rotate environment light 360 degrees over frames.
         seed: random seed (default: from config). Use different seeds for varied outputs.
         num_samples: number of samples to generate. Each gets a different seed.
             When num_samples > 1, returns list of list of PIL Images.
@@ -41,112 +71,84 @@ def forward_render(gbuffers_list, hdr_path, device="cuda", rotate_light=False,
         list of list of PIL Images (num_samples>1).
     """
     from omegaconf import OmegaConf
-    from diffusers import AutoencoderKLTemporalDecoder, EulerDiscreteScheduler
-    from src.models.custom_unet_st import UNetCustomSpatioTemporalConditionModel
-    from src.models.env_encoder import EnvEncoder
-    from src.pipelines.pipeline_rgbx import RGBXVideoDiffusionPipeline
+    from PIL import Image
     from utils.utils_env_proj import process_environment_map
     from src.data.rendering_utils import envmap_vec
 
     cfg = OmegaConf.load("configs/xrgb_inference.yaml")
-    weights = cfg.inference_model_weights
-    n_frames = cfg.inference_n_frames  # 24
-    base_seed = seed if seed is not None else cfg.get("seed", 0)
+    n_frames = cfg.inference_n_frames
+    base_seed = seed if seed is not None else cfg.get("seed", 1000)
 
-    # Normalize input: single dict → list of identical frames
     if isinstance(gbuffers_list, dict):
         gbuffers_list = [gbuffers_list] * n_frames
 
-    # Build pipeline
     print("Loading model...")
-    env_encoder = EnvEncoder.from_pretrained(weights, subfolder="env_encoder")
-    vae = AutoencoderKLTemporalDecoder.from_pretrained(weights, subfolder="vae")
-    unet = UNetCustomSpatioTemporalConditionModel.from_pretrained(weights, subfolder="unet")
-    scheduler = EulerDiscreteScheduler.from_pretrained(weights, subfolder="scheduler")
+    model = _load_model(cfg, device=device)
 
-    dtype = torch.float16
-    for m in [env_encoder, vae, unet]:
-        m.to(device, dtype=dtype)
-
-    pipeline = RGBXVideoDiffusionPipeline(
-        vae=vae, image_encoder=None, feature_extractor=None,
-        unet=unet, scheduler=scheduler, env_encoder=env_encoder,
-        scale_cond_latents=cfg.model_pipeline.get("scale_cond_latents", False),
-        cond_mode="env",
-    )
-    pipeline.scheduler.register_to_config(timestep_spacing="trailing")
-    try:
-        pipeline.load_lora_weights(weights, subfolder="lora", adapter_name="real-lora")
-    except Exception:
-        print("LoRA weights not found, using base weights")
-    pipeline = pipeline.to(device).to(dtype)
-    pipeline.set_progress_bar_config(desc="Denoising")
-
-    # Stack per-frame G-buffers into (1, F, C, H, W)
+    # Stack per-frame G-buffers → (1, 3, T, H, W) in [-1, 1]
     gbuf_names = list(gbuffers_list[0].keys())
-    cond_images = {}
+    cond_tensors = {}
     for name in gbuf_names:
-        frames_t = torch.stack([gb[name] for gb in gbuffers_list], dim=0)  # (F, H, W, 3)
-        cond_images[name] = frames_t.unsqueeze(0).permute(0, 1, 4, 2, 3).to(device)  # (1, F, 3, H, W)
+        frames_t = torch.stack([gb[name] for gb in gbuffers_list], dim=0)  # (T, H, W, 3)
+        t = frames_t.permute(3, 0, 1, 2).unsqueeze(0).to(device)  # (1, 3, T, H, W)
+        cond_tensors[name] = t * 2 - 1  # [0,1] → [-1,1]
 
     # Environment map
-    env_resolution = tuple(cfg.model_pipeline.get("env_resolution", [512, 512]))
+    env_resolution = tuple(cfg.get("env_resolution", [704, 1280]))
     env_dict = process_environment_map(
         hdr_path, resolution=env_resolution, num_frames=n_frames,
         fixed_pose=True, rotate_envlight=rotate_light,
         env_format=["proj", "fixed", "ball"], device=device,
     )
-    cond_images["env_ldr"] = env_dict["env_ldr"].unsqueeze(0).permute(0, 1, 4, 2, 3)
-    cond_images["env_log"] = env_dict["env_log"].unsqueeze(0).permute(0, 1, 4, 2, 3)
-    env_nrm = envmap_vec(env_resolution, device=device) * 0.5 + 0.5
-    cond_images["env_nrm"] = env_nrm.unsqueeze(0).unsqueeze(0).permute(0, 1, 4, 2, 3).expand_as(cond_images["env_ldr"])
+    cond_tensors["env_ldr"] = env_dict["env_ldr"].unsqueeze(0).permute(0, 4, 1, 2, 3) * 2 - 1
+    cond_tensors["env_log"] = env_dict["env_log"].unsqueeze(0).permute(0, 4, 1, 2, 3) * 2 - 1
+    env_nrm = envmap_vec(env_resolution, device=device)  # already [-1,1]
+    cond_tensors["env_nrm"] = env_nrm.unsqueeze(0).unsqueeze(0).permute(0, 4, 1, 2, 3).expand_as(cond_tensors["env_ldr"])
 
-    cond_labels = cfg.model_pipeline.cond_images
-    autocast_ctx = torch.autocast(device, enabled=True) if device == "cuda" else nullcontext()
-    h, w = gbuffers_list[0]["basecolor"].shape[:2]
-
-    # Separate drop_conds: randomize basecolor per sample, truly drop the rest
+    # Handle drop_conds
     randomize_conds = []
-    actual_drop_conds = None
     if drop_conds:
         randomize_conds = [c for c in drop_conds if c == "basecolor"]
-        rest = [c for c in drop_conds if c != "basecolor"]
-        actual_drop_conds = rest or None
+        for c in drop_conds:
+            if c != "basecolor":
+                cond_tensors.pop(c, None)
+
+    # Build data_batch skeleton
+    h, w = cfg.inference_res[0], cfg.inference_res[1]
+    data_batch = {
+        "video": torch.zeros(1, 3, n_frames, h, w, dtype=torch.bfloat16, device=device),
+        "t5_text_embeddings": torch.zeros(1, 512, 1024, dtype=torch.bfloat16, device=device),
+        "t5_text_mask": torch.ones(1, 512, dtype=torch.bfloat16, device=device),
+        "image_size": torch.tensor([[h, w, h, w]], dtype=torch.bfloat16, device=device),
+        "fps": torch.tensor([24], dtype=torch.bfloat16, device=device),
+        "num_frames": torch.tensor([n_frames], dtype=torch.bfloat16, device=device),
+        "padding_mask": torch.zeros(1, 1, h, w, dtype=torch.bfloat16, device=device),
+    }
 
     all_results = []
     for i in range(num_samples):
         current_seed = base_seed + i
         print(f"Running forward rendering (sample {i+1}/{num_samples}, seed={current_seed}, rotate_light={rotate_light})...")
-        generator = torch.Generator(device=device).manual_seed(current_seed)
 
-        # Fill randomized conditions with a random solid color per sample
-        sample_cond_images = cond_images
+        sample_cond = dict(cond_tensors)
         if randomize_conds:
-            sample_cond_images = dict(cond_images)
             rng = torch.Generator().manual_seed(current_seed)
             for name in randomize_conds:
-                color = torch.rand(3, generator=rng)
-                filled = color.view(1, 1, 3, 1, 1).expand_as(cond_images[name]).to(device)
-                sample_cond_images[name] = filled
-                print(f"  {name} → random color ({color[0]:.2f}, {color[1]:.2f}, {color[2]:.2f})")
+                color = torch.rand(3, generator=rng) * 2 - 1
+                filled = color.view(1, 3, 1, 1, 1).expand_as(cond_tensors[name]).to(device)
+                sample_cond[name] = filled
+                print(f"  {name} → random color")
 
-        with autocast_ctx:
-            frames = pipeline(
-                sample_cond_images, cond_labels,
-                height=h, width=w,
-                num_frames=n_frames,
-                num_inference_steps=cfg.inference_n_steps,
-                min_guidance_scale=cfg.inference_min_guidance_scale,
-                max_guidance_scale=cfg.inference_max_guidance_scale,
-                fps=cfg.get("fps", 7),
-                motion_bucket_id=cfg.get("motion_bucket_id", 127),
-                noise_aug_strength=cfg.get("cond_aug", 0),
-                generator=generator,
-                cross_attention_kwargs={"scale": cfg.get("lora_scale", 0.0)},
-                dynamic_guidance=False,
-                decode_chunk_size=cfg.get("decode_chunk_size", None),
-                drop_conds=actual_drop_conds,
-            ).frames[0]  # list of PIL Images
+        batch = dict(data_batch)
+        for k, v in sample_cond.items():
+            batch[k] = v.to(dtype=torch.bfloat16)
+
+        video = model.generate(batch, guidance=cfg.get("guidance", 0.0),
+                               num_steps=cfg.inference_n_steps, seed=current_seed)
+
+        # video: (1, 3, T, H, W) in [-1, 1] → list of PIL Images
+        video_uint8 = ((1 + video[0]).clamp(0, 2) / 2 * 255).to(torch.uint8)
+        frames = [Image.fromarray(video_uint8[:, t].permute(1, 2, 0).cpu().numpy()) for t in range(video_uint8.shape[1])]
 
         if on_sample is not None:
             on_sample(i, current_seed, frames)
@@ -164,7 +166,8 @@ def main():
     parser.add_argument("input", type=str, help="Path to .zprj file")
     parser.add_argument("--hdr", type=str, default="examples/hdri/sunny_vondelpark_1k.hdr", help="HDR environment map")
     parser.add_argument("--output", type=str, default="output", help="Output directory (default: tmp/<stem>/)")
-    parser.add_argument("--resolution", type=int, default=512, help="Render resolution")
+    parser.add_argument("--resolution", type=int, nargs="+", default=[704, 1280],
+                        help="Render resolution (H W or single value for square)")
     parser.add_argument("--fov", type=float, default=15.0, help="Camera FOV in degrees")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--gbuffer-only", action="store_true", help="Only render G-buffers, skip forward rendering")
@@ -174,10 +177,15 @@ def main():
     parser.add_argument("--gif", action="store_true", help="Save as GIF instead of MP4 (turntable/rotate-light)")
     args = parser.parse_args()
 
+    from omegaconf import OmegaConf
     import zprj_loader
 
+    cfg = OmegaConf.load("configs/xrgb_inference.yaml")
+    res = args.resolution if len(args.resolution) == 2 else [args.resolution[0], args.resolution[0]]
+    n_frames = cfg.inference_n_frames
+
     stem = os.path.splitext(os.path.basename(args.input))[0]
-    out_dir =  f"{args.output}/{stem}/"
+    out_dir = f"{args.output}/{stem}/"
     os.makedirs(out_dir, exist_ok=True)
 
     # 1. Load zprj
@@ -191,16 +199,15 @@ def main():
 
     # 2. Render G-buffers
     if args.mode == "turntable":
-        n_frames = 24
         precomp = precompute_mesh_gpu(mesh, device=args.device)
-        print(f"Rendering {n_frames} turntable frames...")
+        print(f"Rendering {n_frames} turntable frames at {res[0]}x{res[1]}...")
         gbuffers_list = [
-            render_gbuffers(mesh, resolution=args.resolution, fov_deg=args.fov,
+            render_gbuffers(mesh, resolution=res, fov_deg=args.fov,
                             azimuth_deg=i * 360.0 / n_frames, device=args.device, _precomp=precomp)
             for i in range(n_frames)
         ]
     else:
-        gbuffers_list = [render_gbuffers(mesh, resolution=args.resolution, fov_deg=args.fov, device=args.device)]
+        gbuffers_list = [render_gbuffers(mesh, resolution=res, fov_deg=args.fov, device=args.device)]
 
     # Save first frame G-buffers
     for name, tensor in gbuffers_list[0].items():
