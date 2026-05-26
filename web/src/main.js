@@ -404,6 +404,7 @@ function fmtTime(d = new Date()) {
 function openModal(item) {
   const modal = document.getElementById('result-modal');
   const img = document.getElementById('result-modal-img');
+  const video = document.getElementById('result-modal-video');
   const meta = document.getElementById('result-modal-meta');
   const status = document.getElementById('result-modal-status');
   const title = document.getElementById('result-modal-title');
@@ -411,17 +412,30 @@ function openModal(item) {
   title.textContent = item.resultUrl ? 'Rendered Result' : 'Render (in progress)';
   meta.textContent = [
     item.timestamp,
+    item.mode && item.mode !== 'still' ? `Mode: ${item.mode}` : null,
     item.hdr ? `HDR: ${item.hdr}` : null,
     item.bg ? `BG: ${item.bg}` : 'BG: none',
   ].filter(Boolean).join(' · ');
 
   if (item.resultUrl) {
-    img.src = item.resultUrl;
-    img.style.display = '';
+    if (item.resultType === 'video') {
+      video.src = item.resultUrl;
+      video.style.display = '';
+      img.style.display = 'none';
+      img.removeAttribute('src');
+      video.play().catch(() => {});
+    } else {
+      img.src = item.resultUrl;
+      img.style.display = '';
+      video.style.display = 'none';
+      video.removeAttribute('src');
+    }
     status.textContent = '';
   } else {
     img.removeAttribute('src');
     img.style.display = 'none';
+    video.style.display = 'none';
+    video.removeAttribute('src');
     status.innerHTML = '<span class="spinner"></span><span>Rendering...</span>';
   }
 
@@ -447,9 +461,16 @@ function refreshGallery() {
     const el = document.createElement('div');
     el.className = 'gallery-item' + (item.resultUrl ? '' : ' pending');
     if (item.resultUrl) {
-      const img = document.createElement('img');
-      img.src = item.resultUrl;
-      el.appendChild(img);
+      if (item.resultType === 'video') {
+        const v = document.createElement('video');
+        v.src = item.resultUrl;
+        v.autoplay = true; v.loop = true; v.muted = true; v.playsInline = true;
+        el.appendChild(v);
+      } else {
+        const img = document.createElement('img');
+        img.src = item.resultUrl;
+        el.appendChild(img);
+      }
     } else if (item.gbuffers.basecolor) {
       // While result is loading, show the basecolor capture as placeholder
       const img = document.createElement('img');
@@ -467,20 +488,33 @@ function refreshGallery() {
 }
 
 function setupModalHover() {
-  const big = document.getElementById('result-modal-img');
-  let savedResultSrc = null;
+  const bigImg = document.getElementById('result-modal-img');
+  const bigVideo = document.getElementById('result-modal-video');
+  let savedImgSrc = null;
+  let savedVideoVisible = false;
   for (const tile of document.querySelectorAll('.modal-gbuffer')) {
     tile.addEventListener('mouseenter', () => {
       const item = document.getElementById('result-modal')._activeItem;
       const src = item?.gbuffers[tile.dataset.buf];
       if (!src) return;
-      if (savedResultSrc === null) savedResultSrc = big.src;
-      big.src = src;
+      if (savedImgSrc === null) {
+        savedImgSrc = bigImg.src;
+        savedVideoVisible = bigVideo.style.display !== 'none';
+      }
+      // Swap to G-buffer (image)
+      bigImg.src = src;
+      bigImg.style.display = '';
+      bigVideo.style.display = 'none';
     });
     tile.addEventListener('mouseleave', () => {
-      if (savedResultSrc !== null) {
-        big.src = savedResultSrc;
-        savedResultSrc = null;
+      if (savedImgSrc !== null) {
+        bigImg.src = savedImgSrc;
+        if (savedVideoVisible) {
+          bigImg.style.display = 'none';
+          bigVideo.style.display = '';
+        }
+        savedImgSrc = null;
+        savedVideoVisible = false;
       }
     });
   }
@@ -493,14 +527,17 @@ function makeBlackBlob(w, h) {
   return new Promise((resolve) => c.toBlob(resolve, 'image/png'));
 }
 
-async function renderViaServer(panels) {
+async function renderViaServer(panels, mode = 'still') {
   const renderBtn = document.getElementById('render-btn');
+  const rotateBtn = document.getElementById('rotate-light-btn');
   renderBtn.disabled = true;
+  rotateBtn.disabled = true;
 
   const item = {
     timestamp: fmtTime(),
     hdr: activeHdr,
     bg: activeBgPreset,
+    mode,
     gbuffers: {},
     resultUrl: null,
   };
@@ -510,6 +547,7 @@ async function renderViaServer(panels) {
   try {
     const formData = new FormData();
     formData.append('hdr', activeHdr);
+    formData.append('mode', mode);
     if (activeBgPreset) formData.append('bg_preset', activeBgPreset);
     for (const p of panels) {
       const name = p.bufName;
@@ -533,16 +571,15 @@ async function renderViaServer(panels) {
       throw new Error(`Server error ${resp.status}: ${text}`);
     }
     const respCtype = resp.headers.get('Content-Type') || '';
-    if (respCtype.startsWith('image/')) {
-      // Future: server returns the rendered PNG directly
+    if (respCtype.startsWith('image/') || respCtype.startsWith('video/')) {
       const blob = await resp.blob();
       item.resultUrl = URL.createObjectURL(blob);
+      item.resultType = respCtype.startsWith('video/') ? 'video' : 'image';
     } else {
-      // Current: server saved files and returned JSON metadata.
-      // Show basecolor capture as the gallery preview.
       const info = await resp.json();
       item.savedDir = info.saved_dir;
       item.resultUrl = item.gbuffers.basecolor;
+      item.resultType = 'image';
     }
     refreshGallery();
     // If the user has this item's modal open, refresh it
@@ -557,6 +594,7 @@ async function renderViaServer(panels) {
     alert('Render failed: ' + err.message);
   } finally {
     renderBtn.disabled = false;
+    rotateBtn.disabled = false;
   }
 }
 
@@ -845,9 +883,12 @@ async function main() {
     e.target.value = '';
   });
 
-  // Render button
+  // Render buttons
   document.getElementById('render-btn').addEventListener('click', () => {
-    renderViaServer(panels);
+    renderViaServer(panels, 'still');
+  });
+  document.getElementById('rotate-light-btn').addEventListener('click', () => {
+    renderViaServer(panels, 'rotate_light');
   });
 
   // Modal close + hover preview

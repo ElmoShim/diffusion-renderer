@@ -206,7 +206,8 @@ html, body { width: 100%; height: 100%; background: #1a1a1a; color: #eee; font-f
   display: flex; flex-direction: column; gap: 12px;
   width: min(96vw, 1600px);
 }
-#result-modal-img {
+#result-modal-img,
+#result-modal-video {
   display: block;
   width: 100%;
   aspect-ratio: 1280 / 704;
@@ -428,6 +429,7 @@ html, body { width: 100%; height: 100%; background: #1a1a1a; color: #eee; font-f
       </section>
       <section class="side-section">
         <button id="render-btn" class="primary-btn">Render</button>
+        <button id="rotate-light-btn" class="block-btn" style="margin-top:6px;">Rotate Light</button>
       </section>
     </div>
   </aside>
@@ -487,6 +489,7 @@ html, body { width: 100%; height: 100%; background: #1a1a1a; color: #eee; font-f
       <button id="result-modal-close">Close</button>
     </div>
     <img id="result-modal-img" alt="Rendered result">
+    <video id="result-modal-video" autoplay loop muted playsinline style="display:none"></video>
     <div id="result-modal-gbuffers">
       <div class="modal-gbuffer" data-buf="basecolor"><span class="label">Basecolor</span><img></div>
       <div class="modal-gbuffer" data-buf="normal"><span class="label">Normal</span><img></div>

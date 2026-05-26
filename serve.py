@@ -165,6 +165,10 @@ class Handler(SimpleHTTPRequestHandler):
             )
             hdr_name = fs.getfirst("hdr", "")
             bg_preset = fs.getfirst("bg_preset", "")
+            mode = fs.getfirst("mode", "still")
+            if mode not in ("still", "rotate_light"):
+                self._send_text(400, f"Unsupported mode: {mode}")
+                return
 
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             save_dir = os.path.join(OUTPUT_DIR, timestamp)
@@ -202,6 +206,7 @@ class Handler(SimpleHTTPRequestHandler):
                     drop_conds.append(name)
 
             meta = {
+                "mode": mode,
                 "hdr": hdr_name or None,
                 "hdr_path": os.path.relpath(hdr_path, PROJECT_ROOT) if hdr_path else None,
                 "bg_preset": bg_preset or None,
@@ -212,38 +217,49 @@ class Handler(SimpleHTTPRequestHandler):
             with open(os.path.join(save_dir, "meta.json"), "w") as f:
                 json.dump(meta, f, indent=2)
 
-            print(f"[/render] inputs saved → {os.path.relpath(save_dir)} ({w}x{h}) hdr={hdr_name!r} drop={drop_conds}")
+            print(f"[/render] inputs saved → {os.path.relpath(save_dir)} ({w}x{h}) mode={mode} hdr={hdr_name!r} drop={drop_conds}")
             print("[/render] running diffusion forward render...")
 
             # Run forward render (serialize — GPU is shared)
             forward_render = _get_forward_render()
-            result_holder = {"img": None}
+            frames_holder = {"frames": None}
             def on_sample(_i, _seed, frames):
-                result_holder["img"] = frames[0]
+                frames_holder["frames"] = frames
 
             with _render_lock:
                 forward_render(
                     gbuffers, hdr_path, device=Handler.device,
-                    rotate_light=False, num_samples=1,
+                    rotate_light=(mode == "rotate_light"),
+                    num_samples=1,
                     on_sample=on_sample,
                     drop_conds=drop_conds or None,
                 )
 
-            pil_img = result_holder["img"]
-            if pil_img is None:
+            frames = frames_holder["frames"]
+            if not frames:
                 self._send_text(500, "Forward render produced no image")
                 return
 
-            # Save and respond
-            result_path = os.path.join(save_dir, "result.png")
-            pil_img.save(result_path)
-            print(f"[/render] result → {os.path.relpath(result_path)}")
+            if mode == "rotate_light":
+                from utils.utils_render import save_video
+                mp4_path = os.path.join(save_dir, "result.mp4")
+                save_video(frames, mp4_path, fps=10)
+                print(f"[/render] result → {os.path.relpath(mp4_path)} ({len(frames)} frames)")
+                with open(mp4_path, "rb") as f:
+                    data = f.read()
+                content_type = "video/mp4"
+            else:
+                pil_img = frames[0]
+                result_path = os.path.join(save_dir, "result.png")
+                pil_img.save(result_path)
+                print(f"[/render] result → {os.path.relpath(result_path)}")
+                buf = io.BytesIO()
+                pil_img.save(buf, format="PNG")
+                data = buf.getvalue()
+                content_type = "image/png"
 
-            buf = io.BytesIO()
-            pil_img.save(buf, format="PNG")
-            data = buf.getvalue()
             self.send_response(200)
-            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(data)))
             self.send_header("X-Saved-Dir", os.path.relpath(save_dir, PROJECT_ROOT))
             self.end_headers()

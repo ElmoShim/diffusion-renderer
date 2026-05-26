@@ -355,7 +355,12 @@ def build_scene_actors(scene, background=True):
                 continue
 
         has_tcoords = False
-        if mat and mat.diffuse_texture_path and mesh.uv_vertex_count == nv:
+        needs_uv = mat and mesh.uv_vertex_count == nv and (
+            getattr(mat, "diffuse_texture_path", None)
+            or getattr(mat, "roughness_texture_path", None)
+            or getattr(mat, "metalness_texture_path", None)
+        )
+        if needs_uv:
             uvs = np.array(mesh.uvs).reshape(-1, 2).astype(np.float32)
             tc_arr = numpy_support.numpy_to_vtk(uvs, deep=True)
             tc_arr.SetNumberOfComponents(2)

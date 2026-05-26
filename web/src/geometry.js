@@ -253,13 +253,23 @@ export async function buildSceneActors(scene) {
     } catch { /* no transform */ }
 
     let diffuseTex = null;
-    if (mat && mat.diffuseTexturePath && mesh.uvVertexCount === mesh.vertexCount) {
-      const tp = mat.diffuseTexturePath;
-      if (!texCache.has(tp)) {
-        texCache.set(tp, await loadTextureFromScene(scene, tp));
+    let roughnessTex = null;
+    const hasUV = mat && mesh.uvVertexCount === mesh.vertexCount;
+
+    if (hasUV) {
+      if (mat.diffuseTexturePath) {
+        const tp = mat.diffuseTexturePath;
+        if (!texCache.has(tp)) texCache.set(tp, await loadTextureFromScene(scene, tp));
+        diffuseTex = texCache.get(tp);
       }
-      diffuseTex = texCache.get(tp);
-      if (diffuseTex) {
+      if (mat.roughnessTexturePath) {
+        const rp = 'rough:' + mat.roughnessTexturePath;
+        if (!texCache.has(rp)) {
+          texCache.set(rp, await loadTextureFromScene(scene, mat.roughnessTexturePath));
+        }
+        roughnessTex = texCache.get(rp);
+      }
+      if (diffuseTex || roughnessTex) {
         const freshMesh = scene.get_avatarMeshes(i);
         const uvs = freshMesh.getUVs();
         const uvCopy = new Float32Array(uvs.length);
@@ -273,7 +283,7 @@ export async function buildSceneActors(scene) {
 
     actors.push({
       polyData, diffuseColor, roughness: 0.5, metallic: 0.0,
-      diffuseTex, roughnessTex: null, type: 'avatar',
+      diffuseTex, roughnessTex, type: 'avatar',
     });
   }
 
