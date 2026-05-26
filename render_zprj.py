@@ -168,7 +168,7 @@ def main():
     parser.add_argument("--output", type=str, default="output", help="Output directory (default: tmp/<stem>/)")
     parser.add_argument("--resolution", type=int, nargs="+", default=[704, 1280],
                         help="Render resolution (H W or single value for square)")
-    parser.add_argument("--fov", type=float, default=15.0, help="Camera FOV in degrees")
+    parser.add_argument("--fov", type=float, default=10.0, help="Camera FOV in degrees")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--gbuffer-only", action="store_true", help="Only render G-buffers, skip forward rendering")
     parser.add_argument("--mode", choices=["still", "turntable", "rotate-light"], default="still",
