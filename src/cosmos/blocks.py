@@ -241,7 +241,7 @@ class GeneralDITTransformerBlock(nn.Module):
     def forward(self, x, emb_B_D, crossattn_emb, crossattn_mask=None, rope_emb_L_1_1_D=None,
                 adaln_lora_B_3D=None, extra_per_block_pos_emb=None):
         if extra_per_block_pos_emb is not None:
-            x = x + extra_per_block_pos_emb
+            x = x + extra_per_block_pos_emb.to(dtype=x.dtype)
         for block in self.blocks:
             x = block(x, emb_B_D, crossattn_emb, crossattn_mask,
                       rope_emb_L_1_1_D=rope_emb_L_1_1_D, adaln_lora_B_3D=adaln_lora_B_3D)

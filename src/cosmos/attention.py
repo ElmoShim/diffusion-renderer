@@ -90,31 +90,19 @@ def apply_rotary_pos_emb_native(t, freqs):
 
 
 def apply_rotary_pos_emb_cosmos(x, rope_emb):
-    """Apply RoPE to input tensor, matching TransformerEngine convention.
+    """Apply RoPE to input tensor, matching TransformerEngine `apply_rotary_pos_emb`.
 
     x: (seq_len, batch, num_heads, head_dim) format "sbhd"
-    rope_emb: (seq_len, 1, 1, head_dim) containing [t,h,w,t,h,w] frequencies
+    rope_emb: (seq_len, 1, 1, head_dim) where the second half of the last dim is
+        a duplicate of the first (rope_emb = cat([freqs, freqs])).
     """
-    sq, b, nh, hd = x.shape
-    rot_dim = rope_emb.shape[-1]
-
-    # Split rope_emb: first half is positions, second half is duplicate
-    # The format is: cos components use first half, sin components use second half
-    half = rot_dim // 2
-    cos_emb = torch.cos(rope_emb[..., :half])  # (sq, 1, 1, half)
-    sin_emb = torch.sin(rope_emb[..., :half])  # (sq, 1, 1, half)
-
-    x_rot = x[..., :half]
-    x_pass = x[..., half:]
-
-    # Standard rotary: rotate pairs
-    x1, x2 = x_rot[..., :half // 2], x_rot[..., half // 2:]
-    x_rot_out = torch.cat([
-        x1 * cos_emb[..., :half // 2] - x2 * sin_emb[..., :half // 2],
-        x2 * cos_emb[..., half // 2:] + x1 * sin_emb[..., half // 2:],
-    ], dim=-1)
-
-    return torch.cat([x_rot_out, x_pass], dim=-1)
+    orig_dtype = x.dtype
+    cos_emb = torch.cos(rope_emb)  # (sq, 1, 1, head_dim)
+    sin_emb = torch.sin(rope_emb)
+    d = x.shape[-1]
+    half = d // 2
+    x_rot = torch.cat([-x[..., half:], x[..., :half]], dim=-1)
+    return (x * cos_emb + x_rot * sin_emb).to(orig_dtype)
 
 
 class Attention(nn.Module):
@@ -188,6 +176,7 @@ class Attention(nn.Module):
         q = rearrange(q, "s b h d -> b h s d")
         k = rearrange(k, "s b h d -> b h s d")
         v = rearrange(v, "s b h d -> b h s d")
+        v = v.to(dtype=q.dtype)
         out = torch.nn.functional.scaled_dot_product_attention(q, k, v)
         return self.to_out(rearrange(out, "b h s d -> s b (h d)"))
 

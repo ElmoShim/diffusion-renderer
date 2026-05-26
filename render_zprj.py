@@ -98,7 +98,7 @@ def forward_render(gbuffers_list, hdr_path, device="cuda", rotate_light=False,
     env_dict = process_environment_map(
         hdr_path, resolution=env_resolution, num_frames=n_frames,
         fixed_pose=True, rotate_envlight=rotate_light,
-        env_format=["proj", "fixed", "ball"], device=device,
+        env_format=["proj", "fixed"], device=device,
     )
     cond_tensors["env_ldr"] = env_dict["env_ldr"].unsqueeze(0).permute(0, 4, 1, 2, 3) * 2 - 1
     cond_tensors["env_log"] = env_dict["env_log"].unsqueeze(0).permute(0, 4, 1, 2, 3) * 2 - 1

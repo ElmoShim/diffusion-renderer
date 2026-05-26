@@ -1,6 +1,8 @@
 import os
+import sys
 import argparse
 from huggingface_hub import snapshot_download
+from huggingface_hub.errors import HfHubHTTPError
 
 COSMOS_MODELS = {
     "forward": {
@@ -14,14 +16,38 @@ COSMOS_MODELS = {
     "tokenizer": {
         "repo_id": "nvidia/Cosmos-Tokenize1-CV8x8x8-720p",
         "local_dir": "Cosmos-Tokenize1-CV8x8x8-720p",
+        "gated": True,
     },
 }
+
+GATED_HELP = """
+{repo_id} is a gated repository.
+
+To download it:
+  1. Go to https://huggingface.co/{repo_id}
+  2. Accept the license agreement
+  3. Make sure your HF token has "Read access to contents of all public gated repos"
+     (Settings → Access Tokens → edit token → Permissions)
+  4. Run: huggingface-cli login
+  5. Re-run this script
+"""
 
 
 def download(repo_id, local_dir):
     os.makedirs(local_dir, exist_ok=True)
-    snapshot_download(repo_id, local_dir=local_dir)
-    print(f"Downloaded {repo_id} → {local_dir}")
+    try:
+        snapshot_download(repo_id, local_dir=local_dir)
+        print(f"Downloaded {repo_id} → {local_dir}")
+    except Exception as e:
+        msg = str(e)
+        chain = e
+        while chain.__cause__:
+            msg += " " + str(chain.__cause__)
+            chain = chain.__cause__
+        if "403" in msg or "Forbidden" in msg or "gated" in msg.lower():
+            print(GATED_HELP.format(repo_id=repo_id))
+            sys.exit(1)
+        raise
 
 
 def main():
@@ -60,7 +86,7 @@ def main():
         local_dir = os.path.join(args.checkpoint_dir, info["local_dir"])
         download(info["repo_id"], local_dir)
 
-    print("Done. Run forward rendering with:")
+    print("\nDone. Run forward rendering with:")
     print("  python render_zprj.py samples/garment.zprj")
 
 

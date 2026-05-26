@@ -27,6 +27,11 @@ def skip_init_linear():
 
 
 def non_strict_load_model(model: torch.nn.Module, state_dict: dict):
+    # Strip "net." prefix if present (official checkpoints store keys as "net.x_embedder...").
+    if any(k.startswith("net.") for k in state_dict.keys()):
+        state_dict = {k[len("net."):] if k.startswith("net.") else k: v
+                      for k, v in state_dict.items()}
+
     model_sd = model.state_dict()
     incorrect = []
     for k in list(state_dict.keys()):
@@ -47,10 +52,14 @@ def non_strict_load_model(model: torch.nn.Module, state_dict: dict):
         print(f"  Incorrect shapes: {len(incorrect)}")
 
 
-class CosmosForwardRenderer(torch.nn.Module):
+class CosmosRendererBase(torch.nn.Module):
+    """Shared base for Cosmos forward/inverse diffusion renderers."""
+
+    use_context_embedding: bool = False
+
     def __init__(
         self,
-        condition_keys: List[str] = None,
+        condition_keys: List[str],
         condition_drop_rate: float = 0.05,
         append_condition_mask: bool = True,
         num_frames: int = 57,
@@ -59,11 +68,6 @@ class CosmosForwardRenderer(torch.nn.Module):
         sigma_data: float = 0.5,
     ):
         super().__init__()
-        if condition_keys is None:
-            condition_keys = [
-                "basecolor", "normal", "metallic", "roughness",
-                "depth", "env_ldr", "env_log", "env_nrm",
-            ]
         self.condition_keys = condition_keys
         self.condition_drop_rate = condition_drop_rate
         self.append_condition_mask = append_condition_mask
@@ -76,12 +80,11 @@ class CosmosForwardRenderer(torch.nn.Module):
 
         n_cond = len(condition_keys)
         ch_per_cond = 16 + (1 if append_condition_mask else 0)
-        additional_concat_ch = ch_per_cond * n_cond
+        self.additional_concat_ch = ch_per_cond * n_cond
 
         self.tokenizer = CosmosTokenizer(pixel_chunk_duration=num_frames)
 
         self.net = None
-        self.additional_concat_ch = additional_concat_ch
 
         self.scheduler = EDMEulerScheduler(
             sigma_max=80, sigma_min=0.02, sigma_data=sigma_data,
@@ -109,7 +112,7 @@ class CosmosForwardRenderer(torch.nn.Module):
                 pos_emb_cls="rope3d",
                 pos_emb_learnable=False,
                 pos_emb_interpolation="crop",
-                affline_emb_norm=False,
+                affline_emb_norm=True,
                 use_adaln_lora=True,
                 adaln_lora_dim=256,
                 rope_h_extrapolation_ratio=1.0,
@@ -118,7 +121,7 @@ class CosmosForwardRenderer(torch.nn.Module):
                 extra_per_block_abs_pos_emb=True,
                 extra_per_block_abs_pos_emb_type="sincos",
                 additional_concat_ch=self.additional_concat_ch,
-                use_context_embedding=False,
+                use_context_embedding=self.use_context_embedding,
             )
 
     def load_checkpoint(self, checkpoint_path: str):
@@ -191,7 +194,16 @@ class CosmosForwardRenderer(torch.nn.Module):
             num_frames=data_batch.get("num_frames"),
             image_size=data_batch.get("image_size"),
             latent_condition=latent_condition,
+            context_index=data_batch.get("context_index"),
         )
+
+    def _shape_source(self, data_batch: dict) -> Tensor:
+        for key in self.condition_keys:
+            if key in data_batch:
+                return data_batch[key]
+        if "video" in data_batch:
+            return data_batch["video"]
+        raise KeyError("No condition key or 'video' present in data_batch to derive shape.")
 
     @torch.no_grad()
     def generate(
@@ -204,15 +216,16 @@ class CosmosForwardRenderer(torch.nn.Module):
         latent_condition = self.prepare_latent_conditions(data_batch)
         condition = self.build_condition(data_batch, latent_condition)
 
+        src = self._shape_source(data_batch)
         C = self.tokenizer.channel
-        T_pixel = data_batch[self.condition_keys[0]].shape[2]
+        T_pixel = src.shape[2]
         F = (T_pixel - 1) // 8 + 1
-        H = data_batch[self.condition_keys[0]].shape[3] // self.tokenizer.spatial_compression_factor
-        W = data_batch[self.condition_keys[0]].shape[4] // self.tokenizer.spatial_compression_factor
+        H = src.shape[3] // self.tokenizer.spatial_compression_factor
+        W = src.shape[4] // self.tokenizer.spatial_compression_factor
         state_shape = (1, C, F, H, W)
 
         self.scheduler.set_timesteps(num_steps)
-        xt = torch.randn(state_shape, generator=torch.Generator("cuda").manual_seed(seed)) * self.scheduler.init_noise_sigma
+        xt = torch.randn(state_shape, generator=torch.Generator("cpu").manual_seed(seed)).to(**self.tensor_kwargs) * self.scheduler.init_noise_sigma
 
         for t in self.scheduler.timesteps:
             xt = xt.to(**self.tensor_kwargs)
@@ -227,3 +240,58 @@ class CosmosForwardRenderer(torch.nn.Module):
 
         video = self.decode(xt)
         return video
+
+
+class CosmosForwardRenderer(CosmosRendererBase):
+    """Forward renderer: G-buffers + envmap → RGB."""
+
+    use_context_embedding = False
+
+    def __init__(
+        self,
+        condition_keys: List[str] = None,
+        condition_drop_rate: float = 0.05,
+        append_condition_mask: bool = True,
+        num_frames: int = 57,
+        height: int = 704,
+        width: int = 1280,
+        sigma_data: float = 0.5,
+    ):
+        if condition_keys is None:
+            condition_keys = [
+                "basecolor", "normal", "metallic", "roughness",
+                "depth", "env_ldr", "env_log", "env_nrm",
+            ]
+        super().__init__(
+            condition_keys=condition_keys,
+            condition_drop_rate=condition_drop_rate,
+            append_condition_mask=append_condition_mask,
+            num_frames=num_frames, height=height, width=width,
+            sigma_data=sigma_data,
+        )
+
+
+class CosmosInverseRenderer(CosmosRendererBase):
+    """Inverse renderer: RGB → G-buffer (one pass selected via context_index)."""
+
+    use_context_embedding = True
+
+    def __init__(
+        self,
+        condition_keys: List[str] = None,
+        condition_drop_rate: float = 0.0,
+        append_condition_mask: bool = False,
+        num_frames: int = 57,
+        height: int = 704,
+        width: int = 1280,
+        sigma_data: float = 0.5,
+    ):
+        if condition_keys is None:
+            condition_keys = ["rgb"]
+        super().__init__(
+            condition_keys=condition_keys,
+            condition_drop_rate=condition_drop_rate,
+            append_condition_mask=append_condition_mask,
+            num_frames=num_frames, height=height, width=width,
+            sigma_data=sigma_data,
+        )

@@ -119,18 +119,21 @@ class CosmosTokenizer(torch.nn.Module):
 
     def _encode_image(self, state):
         in_dtype = state.dtype
-        encoded = self.encoder(state.squeeze(2).to(self.dtype))
+        encoded = self.encoder(state.to(self.dtype))
         if isinstance(encoded, tuple):
             encoded = encoded[0]
-        encoded = encoded.unsqueeze(2)
+        if encoded.dim() == 4:
+            encoded = encoded.unsqueeze(2)
         return ((encoded.to(in_dtype) - self.image_latent_mean.to(in_dtype))
                 / self.image_latent_std.to(in_dtype))
 
     def _decode_image(self, latent):
         in_dtype = latent.dtype
         latent = latent * self.image_latent_std.to(in_dtype) + self.image_latent_mean.to(in_dtype)
-        decoded = self.decoder(latent.squeeze(2).to(self.dtype))
-        return decoded.to(in_dtype).unsqueeze(2)
+        decoded = self.decoder(latent.to(self.dtype))
+        if decoded.dim() == 4:
+            decoded = decoded.unsqueeze(2)
+        return decoded.to(in_dtype)
 
     def _encode_video(self, state):
         B, C, T, H, W = state.shape

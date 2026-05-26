@@ -152,17 +152,18 @@ def look_at(eye, target, up):
     return m
 
 
-def perspective(fov_deg, near, far):
+def perspective(fov_deg, near, far, aspect=1.0):
     t = math.tan(math.radians(fov_deg) / 2.0)
     p = np.zeros((4, 4), dtype=np.float32)
-    p[0, 0] = 1.0 / t; p[1, 1] = 1.0 / t
+    p[0, 0] = 1.0 / (t * aspect)
+    p[1, 1] = 1.0 / t
     p[2, 2] = -(far + near) / (far - near)
     p[2, 3] = -2.0 * far * near / (far - near)
     p[3, 2] = -1.0
     return p
 
 
-def auto_camera(positions, fov_deg=15.0, azimuth_deg=0.0):
+def auto_camera(positions, fov_deg=15.0, azimuth_deg=0.0, aspect=1.0):
     """Camera that orbits around the mesh center at the given azimuth angle."""
     center = (positions.max(0) + positions.min(0)) / 2.0
     ext = (positions.max(0) - positions.min(0)).max()
@@ -173,7 +174,7 @@ def auto_camera(positions, fov_deg=15.0, azimuth_deg=0.0):
     near = max(dist - ext, 0.1)
     far = dist + ext
     view = look_at(eye, center, up)
-    proj = perspective(fov_deg, near, far)
+    proj = perspective(fov_deg, near, far, aspect=aspect)
     return proj @ view, view
 
 
@@ -470,7 +471,13 @@ def render_gbuffers(mesh, resolution=512, fov_deg=15.0, azimuth_deg=0.0, device=
     faces_np = mesh["faces"]
     textures = mesh["textures"]
 
-    mvp, view = auto_camera(pos_np, fov_deg, azimuth_deg)
+    if isinstance(resolution, (list, tuple)):
+        res_h, res_w = resolution
+    else:
+        res_h = res_w = resolution
+    aspect = res_w / res_h
+
+    mvp, view = auto_camera(pos_np, fov_deg, azimuth_deg, aspect=aspect)
     mvp_t = torch.from_numpy(mvp).to(device)
     view_t = torch.from_numpy(view).to(device)
 
@@ -491,7 +498,11 @@ def render_gbuffers(mesh, resolution=512, fov_deg=15.0, azimuth_deg=0.0, device=
         glctx = dr.RasterizeCudaContext()
 
     clip = (pos_h @ mvp_t.T).unsqueeze(0)
-    rast, _ = dr.rasterize(glctx, clip, tri, resolution=[resolution, resolution])
+    if isinstance(resolution, (list, tuple)):
+        rast_res = list(resolution)
+    else:
+        rast_res = [resolution, resolution]
+    rast, _ = dr.rasterize(glctx, clip, tri, resolution=rast_res)
     mask = (rast[..., 3:4] > 0).float()
 
     # Texture mask: apply textures only to garment faces (first N faces)

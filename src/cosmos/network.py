@@ -206,6 +206,8 @@ class GeneralDIT(nn.Module):
 
         if self.block_x_format == "THWBD":
             x_T_H_W_B_D = rearrange(x_B_T_H_W_D, "b t h w d -> t h w b d")
+            if extra_pos_emb is not None:
+                extra_pos_emb = rearrange(extra_pos_emb, "b t h w d -> t h w b d")
         else:
             raise ValueError(f"Unknown block_x_format: {self.block_x_format}")
 
@@ -227,7 +229,7 @@ class GeneralDIT(nn.Module):
         W = x_B_T_H_W_D.shape[3]
         x_B_C_T_H_W = rearrange(
             x_BT_HW_D,
-            "(b t) (h w) (c ph pw pt) -> b c (t pt) (h ph) (w pw)",
+            "(b t) (h w) (ph pw pt c) -> b c (t pt) (h ph) (w pw)",
             b=B, t=T, h=H, w=W,
             ph=self.patch_spatial, pw=self.patch_spatial, pt=self.patch_temporal,
         )
