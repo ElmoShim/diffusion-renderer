@@ -1,0 +1,16 @@
+# Cosmos Transfer1 Diffusion Renderer — Inverse
+checkpoint_dir: './checkpoints'
+model_checkpoint: 'Diffusion_Renderer_Inverse_Cosmos_7B/model.pt'
+tokenizer_dir: 'Cosmos-Tokenize1-CV8x8x8-720p'
+
+inference_res: [ 704, 1280 ]
+inference_n_frames: 1
+inference_n_steps: 15
+guidance: 0.0
+
+condition_keys:
+  - rgb
+
+append_condition_mask: false
+
+seed: 1000

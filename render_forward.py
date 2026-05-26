@@ -65,6 +65,7 @@ def load_gbuffers(input_dir, resolution=None):
 def main():
     parser = argparse.ArgumentParser(description="Forward-render G-buffer PNGs with the diffusion renderer.")
     parser.add_argument("input_dir", type=str, help="Directory containing G-buffer PNGs (basecolor, normal, depth, roughness, metallic). Missing buffers are zero-filled.")
+    parser.add_argument("--output", type=str, default="output", help="Output directory (default: tmp/<stem>/)")
     parser.add_argument("--hdr", type=str, default="examples/hdri/sunny_vondelpark_1k.hdr", help="HDR environment map")
     parser.add_argument("--mode", choices=["still", "rotate-light"], default="still",
                         help="still: single image | rotate-light: light rotates 360°")
@@ -83,7 +84,7 @@ def main():
 
     # Output directory
     dir_basename = os.path.basename(os.path.normpath(args.input_dir))
-    out_dir = f"./tmp/{dir_basename}_rendered"
+    out_dir = f"{args.output}/{dir_basename}_rendered"
     os.makedirs(out_dir, exist_ok=True)
 
     # Save callback — saves each sample immediately after generation

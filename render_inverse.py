@@ -1,153 +1,254 @@
-"""Inverse-render: estimate G-buffers from a single image.
+"""Inverse-render with Cosmos Diffusion Renderer: RGB image/video → G-buffer maps.
+
+Estimates basecolor, normal, depth, roughness, and metallic maps from input
+images or videos using the Diffusion_Renderer_Inverse_Cosmos_7B model.
 
 Usage:
-    python render_inverse.py photo.png
-    python render_inverse.py photo.png --output results/
-    python render_inverse.py photo.png --resolution 512 --seed 42
+    # Single image (1 frame)
+    python render_inverse.py asset/examples/image_examples/image_1.jpg
+
+    # Folder of images, each processed independently
+    python render_inverse.py asset/examples/image_examples/
+
+    # Video file (frames extracted automatically)
+    python render_inverse.py asset/examples/video_examples/video1.mp4 --num-frames 57
+
+    # Select only some G-buffer passes
+    python render_inverse.py asset/examples/image_examples/image_1.jpg \\
+        --passes basecolor normal depth
 """
 
 import argparse
 import os
-from contextlib import nullcontext
+from glob import glob
 
 import numpy as np
 import torch
 from PIL import Image
-from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection
-
-from src.pipelines.pipeline_rgbx import RGBXVideoDiffusionPipeline
-from utils.utils_rgbx import convert_rgba_to_rgb_pil
-from utils.utils_rgbx_inference import resize_upscale_without_padding
-
-MODEL_PASSES = ["basecolor", "metallic", "roughness", "normal", "depth"]
-DEFAULT_WEIGHTS = "./checkpoints/diffusion_renderer-inverse-svd"
-DEFAULT_N_FRAMES = 24
-DEFAULT_N_STEPS = 20
 
 
-def load_pipeline(weights_path, device="cuda"):
-    """Load the inverse rendering pipeline."""
-    missing_kwargs = {}
-    missing_kwargs["cond_mode"] = "skip"
-    missing_kwargs["use_deterministic_mode"] = False
+GBUFFER_INDEX_MAPPING = {
+    "basecolor":        0,
+    "metallic":         1,
+    "roughness":        2,
+    "normal":           3,
+    "depth":            4,
+    "diffuse_albedo":   5,
+    "specular_albedo":  6,
+}
 
-    model_weights_subfolders = os.listdir(weights_path) if os.path.exists(weights_path) else []
-    if "image_encoder" not in model_weights_subfolders:
-        missing_kwargs["image_encoder"] = CLIPVisionModelWithProjection.from_pretrained(
-            "stabilityai/stable-video-diffusion-img2vid", subfolder="image_encoder",
-        )
-    if "feature_extractor" not in model_weights_subfolders:
-        missing_kwargs["feature_extractor"] = CLIPImageProcessor.from_pretrained(
-            "stabilityai/stable-video-diffusion-img2vid", subfolder="feature_extractor",
-        )
-
-    print("Loading inverse rendering model...")
-    pipeline = RGBXVideoDiffusionPipeline.from_pretrained(weights_path, **missing_kwargs)
-    pipeline = pipeline.to(device)
-    pipeline = pipeline.to(torch.float16)
-    pipeline.set_progress_bar_config(disable=True)
-    return pipeline
+DEFAULT_PASSES = ["basecolor", "normal", "depth", "roughness", "metallic"]
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".tiff")
+VIDEO_EXTS = (".mp4", ".mov", ".avi", ".mkv", ".webm")
 
 
-def inverse_render(image_path, pipeline, device="cuda", resolution=512,
-                   n_frames=DEFAULT_N_FRAMES, n_steps=DEFAULT_N_STEPS, seed=0):
-    """Run inverse rendering on a single image.
+_model_cache = None
+
+
+def _load_model(cfg, device="cuda"):
+    global _model_cache
+    if _model_cache is not None:
+        return _model_cache
+
+    from src.cosmos.model import CosmosInverseRenderer
+
+    model = CosmosInverseRenderer(
+        condition_keys=list(cfg.condition_keys),
+        condition_drop_rate=0.0,
+        append_condition_mask=cfg.append_condition_mask,
+        num_frames=cfg.inference_n_frames,
+        height=cfg.inference_res[0],
+        width=cfg.inference_res[1],
+    )
+    model.build_network()
+
+    ckpt_path = os.path.join(cfg.checkpoint_dir, cfg.model_checkpoint)
+    model.load_checkpoint(ckpt_path)
+
+    tokenizer_dir = os.path.join(cfg.checkpoint_dir, cfg.tokenizer_dir)
+    model.load_tokenizer(tokenizer_dir)
+
+    model.to_device()
+    model.eval()
+    _model_cache = model
+    return model
+
+
+def _load_frames_from_path(path, num_frames, resolution):
+    """Load input as (T, H, W, 3) uint8 numpy array, padding/truncating to num_frames."""
+    h, w = resolution
+    ext = os.path.splitext(path)[1].lower()
+
+    if ext in VIDEO_EXTS:
+        import imageio.v3 as imageio
+        frames = imageio.imread(path)  # (T, H, W, C) or (H, W, C)
+        if frames.ndim == 3:
+            frames = frames[None]
+        frames = frames[..., :3]
+    elif ext in IMAGE_EXTS:
+        img = Image.open(path).convert("RGB")
+        frames = np.asarray(img)[None]  # (1, H, W, 3)
+    else:
+        raise ValueError(f"Unsupported file extension: {ext}")
+
+    # Resize each frame using PIL
+    out = []
+    for f in frames:
+        pil = Image.fromarray(f).resize((w, h), Image.BILINEAR)
+        out.append(np.asarray(pil))
+    frames = np.stack(out, axis=0)
+
+    if frames.shape[0] < num_frames:
+        pad = np.repeat(frames[-1:], num_frames - frames.shape[0], axis=0)
+        frames = np.concatenate([frames, pad], axis=0)
+    else:
+        frames = frames[:num_frames]
+    return frames  # (T, H, W, 3) uint8
+
+
+def _build_data_batch(frames_uint8, cfg, device):
+    """Build the data_batch dict expected by CosmosInverseRenderer.generate."""
+    h, w = cfg.inference_res
+    n_frames = cfg.inference_n_frames
+
+    rgb = torch.from_numpy(frames_uint8).float() / 255.0  # (T, H, W, 3)
+    rgb = rgb.permute(3, 0, 1, 2).unsqueeze(0).to(device)  # (1, 3, T, H, W)
+    rgb = rgb * 2 - 1  # [-1, 1]
+    rgb = rgb.to(torch.bfloat16)
+
+    data_batch = {
+        "rgb": rgb,
+        "video": rgb,  # used by tokenizer encode pathway / shape inference
+        "t5_text_embeddings": torch.zeros(1, 512, 1024, dtype=torch.bfloat16, device=device),
+        "t5_text_mask": torch.ones(1, 512, dtype=torch.bfloat16, device=device),
+        "image_size": torch.tensor([[h, w, h, w]], dtype=torch.bfloat16, device=device),
+        "fps": torch.tensor([24], dtype=torch.bfloat16, device=device),
+        "num_frames": torch.tensor([n_frames], dtype=torch.bfloat16, device=device),
+        "padding_mask": torch.zeros(1, 1, h, w, dtype=torch.bfloat16, device=device),
+        "context_index": torch.zeros(1, dtype=torch.long, device=device),
+    }
+    return data_batch
+
+
+def _normalize_normal_video(video):
+    """Match official: normalize unit-length only where magnitude is strong."""
+    norm = torch.norm(video, dim=1, p=2, keepdim=True)
+    normalized = video / norm.clamp(min=1e-12)
+    upper, lower = 0.4, 0.2
+    blend = torch.clip((norm - lower) / (upper - lower), 0, 1)
+    return normalized * blend + video * (1 - blend)
+
+
+def inverse_render(input_path, passes=None, device="cuda", seed=None):
+    """Run inverse rendering on an image or video.
 
     Args:
-        image_path: path to input image.
-        pipeline: loaded RGBXVideoDiffusionPipeline.
-        device: torch device string.
-        resolution: target resolution.
-        n_frames: number of frames for the SVD model.
-        n_steps: number of denoising steps.
+        input_path: image, video, or folder path.
+        passes: list of G-buffer pass names. Defaults to DEFAULT_PASSES.
+        device: torch device.
         seed: random seed.
 
     Returns:
-        Tuple of (results dict mapping pass name to PIL Image, resized input PIL Image).
+        dict {pass_name: (T, H, W, 3) uint8 numpy array}, plus key "rgb_input"
+        with the (resized) input frames.
     """
-    # Load and preprocess input image
-    input_image = Image.open(image_path)
-    input_image = convert_rgba_to_rgb_pil(input_image, background_color=(0, 0, 0))
+    from omegaconf import OmegaConf
 
-    width, height = input_image.size
-    if width != resolution or height != resolution:
-        input_image = resize_upscale_without_padding(input_image, resolution, resolution)
-    width, height = input_image.size
+    cfg = OmegaConf.load("configs/xrgb_inverse_inference.yaml")
+    if passes is None:
+        passes = DEFAULT_PASSES
 
-    # Replicate to n_frames
-    image_uint8 = np.asarray(input_image)
-    input_images = np.stack([image_uint8] * n_frames, axis=0)[None, ...].astype(np.float32) / 255.0
-    cond_images = {"rgb": input_images}
-    cond_labels = {"rgb": "vae"}
+    if seed is None:
+        seed = cfg.get("seed", 1000)
 
-    if torch.backends.mps.is_available():
-        autocast_ctx = nullcontext()
-    else:
-        autocast_ctx = torch.autocast(device, enabled=True)
+    model = _load_model(cfg, device=device)
 
-    # Run each G-buffer pass
-    results = {}
-    for pass_name in MODEL_PASSES:
-        print(f"  Estimating {pass_name}...")
-        cond_images["input_context"] = pass_name
-        generator = torch.Generator(device=device).manual_seed(seed)
+    frames = _load_frames_from_path(input_path, cfg.inference_n_frames, cfg.inference_res)
+    data_batch = _build_data_batch(frames, cfg, device=device)
 
-        with autocast_ctx:
-            frames = pipeline(
-                cond_images, cond_labels,
-                height=height, width=width,
-                num_frames=n_frames,
-                num_inference_steps=n_steps,
-                min_guidance_scale=1.0,
-                max_guidance_scale=1.0,
-                fps=7,
-                motion_bucket_id=127,
-                noise_aug_strength=0,
-                generator=generator,
-                decode_chunk_size=8,
-            ).frames[0]
+    results = {"rgb_input": frames}
+    for pass_name in passes:
+        if pass_name not in GBUFFER_INDEX_MAPPING:
+            print(f"  Skipping unknown pass: {pass_name}")
+            continue
+        idx = GBUFFER_INDEX_MAPPING[pass_name]
+        data_batch["context_index"] = torch.tensor([idx], dtype=torch.long, device=device)
+        print(f"  Estimating {pass_name} (context_index={idx})...")
 
-        results[pass_name] = frames[0]
+        video = model.generate(
+            data_batch,
+            guidance=cfg.get("guidance", 0.0),
+            num_steps=cfg.inference_n_steps,
+            seed=seed,
+        )
 
-    return results, input_image
+        if pass_name == "normal":
+            video = _normalize_normal_video(video)
+
+        # (1, 3, T, H, W) in [-1, 1] → (T, H, W, 3) uint8
+        video = (1.0 + video).clamp(0, 2) / 2
+        out = (video[0].permute(1, 2, 3, 0) * 255).to(torch.uint8).cpu().numpy()
+        results[pass_name] = out
+
+    return results
+
+
+def _expand_input(path):
+    """Return a list of (display_name, abs_path) pairs."""
+    if os.path.isdir(path):
+        items = []
+        for ext in IMAGE_EXTS + VIDEO_EXTS:
+            items.extend(sorted(glob(os.path.join(path, f"*{ext}"))))
+        return [(os.path.splitext(os.path.basename(p))[0], p) for p in items]
+    return [(os.path.splitext(os.path.basename(path))[0], path)]
+
+
+def _save_results(results, out_dir, fps=24):
+    os.makedirs(out_dir, exist_ok=True)
+    for name, frames in results.items():
+        if frames.shape[0] == 1:
+            Image.fromarray(frames[0]).save(os.path.join(out_dir, f"{name}.png"))
+        else:
+            # Save first frame as preview and full sequence as mp4
+            Image.fromarray(frames[0]).save(os.path.join(out_dir, f"{name}.png"))
+            try:
+                import imageio.v3 as imageio
+                imageio.imwrite(os.path.join(out_dir, f"{name}.mp4"), frames, fps=fps)
+            except Exception as e:
+                print(f"  (mp4 save failed for {name}: {e})")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Inverse-render: estimate G-buffers from a single image.")
-    parser.add_argument("image", type=str, help="Path to input image (PNG, JPG, etc.)")
-    parser.add_argument("--output", type=str, default=None, help="Output directory (default: tmp/<stem>_inverse/)")
-    parser.add_argument("--weights", type=str, default=DEFAULT_WEIGHTS, help="Model weights directory")
-    parser.add_argument("--resolution", type=int, default=512, help="Inference resolution")
-    parser.add_argument("--steps", type=int, default=DEFAULT_N_STEPS, help="Number of denoising steps")
-    parser.add_argument("--seed", type=int, default=0, help="Random seed")
-    parser.add_argument("--device", type=str, default="cuda", help="Device (cuda, cpu, mps)")
+    parser = argparse.ArgumentParser(description="Cosmos inverse renderer: RGB → G-buffers.")
+    parser.add_argument("input", type=str, help="Image, video, or folder path")
+    parser.add_argument("--output", type=str, default="output/inverse",
+                        help="Output directory")
+    parser.add_argument("--passes", type=str, nargs="+", default=DEFAULT_PASSES,
+                        choices=list(GBUFFER_INDEX_MAPPING.keys()),
+                        help=f"G-buffer passes to estimate (default: {' '.join(DEFAULT_PASSES)})")
+    parser.add_argument("--num-frames", type=int, default=None,
+                        help="Override inference_n_frames from config")
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--device", type=str, default="cuda")
     args = parser.parse_args()
 
-    if not os.path.exists(args.image):
-        print(f"Error: {args.image} not found")
+    if args.num_frames is not None:
+        from omegaconf import OmegaConf
+        cfg = OmegaConf.load("configs/xrgb_inverse_inference.yaml")
+        cfg.inference_n_frames = args.num_frames
+        OmegaConf.save(cfg, "configs/xrgb_inverse_inference.yaml")
+
+    items = _expand_input(args.input)
+    if not items:
+        print(f"No input files found at {args.input}")
         return
 
-    stem = os.path.splitext(os.path.basename(args.image))[0]
-    out_dir = args.output or f"tmp/{stem}_inverse/"
-    os.makedirs(out_dir, exist_ok=True)
-
-    pipeline = load_pipeline(args.weights, device=args.device)
-
-    print(f"Inverse rendering {args.image} ...")
-    results, input_image = inverse_render(
-        args.image, pipeline,
-        device=args.device, resolution=args.resolution,
-        n_steps=args.steps, seed=args.seed,
-    )
-
-    # Save results
-    input_image.save(os.path.join(out_dir, "input.png"))
-    for name, img in results.items():
-        save_path = os.path.join(out_dir, f"{name}.png")
-        img.save(save_path)
-
-    print(f"Results saved to {out_dir}")
-    print(f"  input.png + {', '.join(f'{n}.png' for n in MODEL_PASSES)}")
+    for stem, path in items:
+        print(f"\n=== {stem} ({path}) ===")
+        results = inverse_render(path, passes=args.passes, device=args.device, seed=args.seed)
+        out_dir = os.path.join(args.output, stem)
+        _save_results(results, out_dir)
+        print(f"  → {out_dir}")
 
 
 if __name__ == "__main__":

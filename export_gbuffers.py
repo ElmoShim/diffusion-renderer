@@ -13,7 +13,8 @@ import argparse
 import os
 
 import zprj_loader
-from utils.utils_render import load_mesh, render_gbuffers, save_tensor_as_png
+from utils.utils_render import save_tensor_as_png
+from utils.utils_render_vtk import render_gbuffers
 
 
 def main():
@@ -36,10 +37,7 @@ def main():
         print(f"Error: {scene.error}")
         return
 
-    mesh = load_mesh(scene)
-    print(f"Mesh: {mesh['positions'].shape[0]} verts, {mesh['faces'].shape[0]} tris")
-
-    gb = render_gbuffers(mesh, resolution=args.resolution, fov_deg=args.fov,
+    gb = render_gbuffers(scene, resolution=args.resolution, fov_deg=args.fov,
                          azimuth_deg=args.azimuth, device=args.device)
     for name, tensor in gb.items():
         save_tensor_as_png(tensor, os.path.join(out_dir, f"{name}.png"))

@@ -1,0 +1,508 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Diffusion Renderer Demo</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; background: #1a1a1a; color: #eee; font-family: system-ui, sans-serif; overflow: hidden; }
+
+#app {
+  display: grid;
+  grid-template-columns: 280px 1fr 140px;
+  grid-template-rows: auto 1fr;
+  grid-template-areas:
+    "sidebar toolbar rightbar"
+    "sidebar main    rightbar";
+  width: 100vw; height: 100vh;
+}
+#toolbar  { grid-area: toolbar; }
+#main     { grid-area: main; }
+#sidebar  { grid-area: sidebar; }
+#rightbar { grid-area: rightbar; }
+
+/* Toolbar */
+#toolbar {
+  display: flex; align-items: center; gap: 12px;
+  padding: 10px 16px; background: #222; border-bottom: 1px solid #333;
+  flex-shrink: 0;
+}
+.app-title {
+  font-size: 14px; font-weight: 600; letter-spacing: 0.04em; color: #eee;
+}
+.icon-btn {
+  width: 32px; height: 32px;
+  background: transparent; border: none; color: #ddd;
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer; border-radius: 4px;
+}
+.icon-btn:hover { background: #333; }
+.hamburger, .hamburger::before, .hamburger::after {
+  display: block; width: 18px; height: 2px; background: currentColor; border-radius: 1px;
+}
+.hamburger { position: relative; }
+.hamburger::before, .hamburger::after {
+  content: ''; position: absolute; left: 0;
+}
+.hamburger::before { top: -6px; }
+.hamburger::after  { top: 6px; }
+
+/* Sidebars (always visible) */
+#sidebar {
+  background: #1f1f1f; border-right: 1px solid #333;
+  display: flex; flex-direction: column;
+  min-height: 0;
+}
+#rightbar {
+  background: #1f1f1f; border-left: 1px solid #333;
+  display: flex; flex-direction: column;
+  min-height: 0;
+}
+#rightbar .sidebar-body { padding: 10px; }
+#rightbar .sidebar-header { padding: 10px; }
+.block-btn {
+  display: block;
+  background: #333; border: 1px solid #555; color: #eee;
+  padding: 6px 14px; border-radius: 4px; cursor: pointer; font: inherit; font-size: 13px;
+  text-align: center; width: 100%;
+}
+.block-btn:hover { background: #444; }
+.primary-btn {
+  display: block; width: 100%;
+  background: #c95a2e; border: 1px solid #c95a2e; color: #fff;
+  padding: 8px 14px; border-radius: 4px; cursor: pointer;
+  font: inherit; font-size: 13px; font-weight: 600;
+}
+.primary-btn:hover { background: #d96838; }
+.primary-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.side-meta { font-size: 11px; color: #888; margin-top: 6px; word-break: break-all; }
+
+.buf-toggles { display: flex; flex-direction: column; gap: 4px; }
+.buf-toggle {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 12px; color: #ddd; cursor: pointer;
+  padding: 3px 6px; border-radius: 3px;
+}
+.buf-toggle:hover { background: #2a2a2a; }
+.buf-toggle input { accent-color: #c95a2e; }
+.sidebar-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 14px; border-bottom: 1px solid #333;
+  font-size: 13px; font-weight: 600;
+}
+.sidebar-header button {
+  background: transparent; border: none; color: #aaa;
+  font-size: 22px; cursor: pointer; line-height: 1; padding: 0 4px;
+}
+.sidebar-header button:hover { color: #fff; }
+.sidebar-body {
+  flex: 1; overflow-y: auto;
+  padding: 14px;
+  display: flex; flex-direction: column; gap: 18px;
+}
+.side-section-title {
+  font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em;
+  color: #888; margin-bottom: 6px;
+}
+.upload-hdr {
+  display: inline-block; padding: 5px 10px;
+  background: #333; border: 1px solid #555; color: #eee;
+  border-radius: 4px; cursor: pointer; font-size: 12px;
+}
+.upload-hdr:hover { background: #444; }
+
+/* Bg + HDR preset thumbnails */
+.bg-thumbs, .hdr-thumbs {
+  display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px;
+}
+.bg-thumb, .hdr-thumb {
+  aspect-ratio: 16/9;
+  background-size: cover; background-position: center;
+  border: 2px solid #444; border-radius: 4px; cursor: pointer;
+  transition: border-color 120ms;
+  position: relative;
+  overflow: hidden;
+}
+.bg-thumb:hover, .hdr-thumb:hover { border-color: #888; }
+.bg-thumb.active, .hdr-thumb.active { border-color: #c95a2e; }
+.bg-thumb.clear {
+  background: #2a2a2a; display: flex; align-items: center; justify-content: center;
+  font-size: 11px; color: #888;
+}
+.hdr-thumb { background: #2a2a2a; }
+.hdr-thumb canvas, .hdr-thumb img {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  display: block; object-fit: cover;
+}
+.hdr-thumb .name {
+  position: absolute; bottom: 0; left: 0; right: 0;
+  background: rgba(0,0,0,0.6); color: #ddd;
+  font-size: 10px; padding: 2px 4px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+/* Main area: G-buffer panels in an auto-row/col grid driven by JS-set --cols/--rows. */
+#main {
+  min-height: 0; min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(var(--cols, 2), 1fr);
+  grid-template-rows: repeat(var(--rows, 2), 1fr);
+  gap: 8px; padding: 12px;
+  background: #1a1a1a;
+}
+.panel-cell.hidden { display: none; }
+
+/* Gallery (sidebar) */
+.gallery {
+  display: flex; flex-direction: column; gap: 8px;
+}
+.gallery:empty::before {
+  content: 'No renders yet';
+  color: #555; font-size: 11px;
+}
+.gallery-item {
+  position: relative;
+  aspect-ratio: 1280/704;
+  background: #2a2a2a;
+  border: 2px solid #444; border-radius: 4px;
+  cursor: pointer; overflow: hidden;
+  transition: border-color 120ms;
+}
+.gallery-item:hover { border-color: #888; }
+.gallery-item img {
+  position: absolute; inset: 0;
+  width: 100%; height: 100%; object-fit: cover;
+}
+.gallery-item .stamp {
+  position: absolute; bottom: 0; left: 0; right: 0;
+  background: rgba(0,0,0,0.65); color: #ddd;
+  font-size: 10px; padding: 2px 4px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.gallery-item.pending {
+  display: flex; align-items: center; justify-content: center;
+}
+.gallery-item.pending::after {
+  content: ''; width: 16px; height: 16px;
+  border: 2px solid rgba(255,255,255,0.15);
+  border-top-color: #c95a2e; border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+/* Result modal */
+#result-modal {
+  position: fixed; inset: 0; z-index: 200;
+  background: rgba(0, 0, 0, 0.88);
+  display: none;
+  align-items: center; justify-content: center;
+  padding: 24px;
+}
+#result-modal.visible { display: flex; }
+#result-modal-content {
+  position: relative;
+  background: #111; border-radius: 8px; padding: 16px;
+  max-width: 100%; max-height: 100%;
+  display: flex; flex-direction: column; gap: 12px;
+  width: min(96vw, 1600px);
+}
+#result-modal-img,
+#result-modal-video {
+  display: block;
+  width: 100%;
+  aspect-ratio: 1280 / 704;
+  max-height: calc(100vh - 260px);
+  background: #000; border-radius: 4px;
+  object-fit: contain;
+}
+#result-modal-header {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px;
+}
+#result-modal-title { font-size: 14px; font-weight: 600; color: #eee; }
+#result-modal-meta { font-size: 11px; color: #888; }
+#result-modal-close {
+  background: #333; border: 1px solid #555; color: #eee;
+  padding: 4px 12px; border-radius: 4px; cursor: pointer;
+  font: inherit; font-size: 12px;
+}
+#result-modal-close:hover { background: #444; }
+#result-modal-status {
+  color: #888; font-size: 12px;
+  display: flex; align-items: center; gap: 8px;
+}
+#result-modal-gbuffers {
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px;
+}
+.modal-gbuffer {
+  position: relative; aspect-ratio: 1280/704;
+  background: #000; border-radius: 4px; overflow: hidden;
+  cursor: pointer;
+  border: 2px solid transparent;
+}
+.modal-gbuffer:hover { border-color: #c95a2e; }
+.modal-gbuffer img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.modal-gbuffer .label {
+  position: absolute; top: 4px; left: 6px;
+  background: rgba(0,0,0,0.6); color: #fff;
+  font-size: 10px; padding: 1px 5px; border-radius: 2px;
+}
+.spinner {
+  width: 14px; height: 14px;
+  border: 2px solid rgba(255,255,255,0.15);
+  border-top-color: #c95a2e;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* Cell wrapper centers the aspect-locked panel inside its cell */
+.panel-cell {
+  position: relative;
+  min-width: 0; min-height: 0;
+  display: flex; align-items: center; justify-content: center;
+  overflow: hidden;
+}
+
+/* Panel: maintain 1280:704 aspect, fit inside its cell */
+.panel {
+  position: relative;
+  background: #000;
+  overflow: hidden;
+  border-radius: 4px;
+  aspect-ratio: 1280 / 704;
+  /* Choose the dimension that fits: container query via container-type
+     fallback — use both max-width:100% and max-height:100% and pick
+     the smaller via min() based on parent. We rely on flex centering
+     in .panel-cell + this trick: */
+  max-width: 100%;
+  max-height: 100%;
+  width: 100%;
+  height: auto;
+}
+/* When the cell is wider than 1280:704 of its height, height becomes
+   the limit — switch to height-driven sizing. */
+@supports (aspect-ratio: 1) {
+  .panel-cell { container-type: size; }
+  @container (min-aspect-ratio: 1280/704) {
+    .panel { width: auto; height: 100%; }
+  }
+}
+.panel-canvas-wrap {
+  position: absolute; inset: 0;
+}
+.panel-bg-img {
+  position: absolute; inset: 0;
+  width: 100%; height: 100%;
+  object-fit: cover;
+  pointer-events: none;
+  display: none;
+}
+.panel-bg-img.visible { display: block; }
+.panel-canvas-wrap canvas { position: relative; z-index: 1; }
+.panel-label {
+  position: absolute; top: 6px; left: 8px; z-index: 10;
+  font-size: 11px; font-weight: 600; color: #fff;
+  background: rgba(0,0,0,0.6); padding: 2px 8px; border-radius: 3px;
+  pointer-events: none;
+}
+.panel-placeholder {
+  position: absolute; inset: 0; display: flex;
+  align-items: center; justify-content: center;
+  color: #555; font-size: 13px;
+  pointer-events: none;
+}
+
+/* Depth controls overlay */
+.depth-controls {
+  position: absolute; top: 6px; right: 8px; z-index: 10;
+  background: rgba(0, 0, 0, 0.55); border-radius: 4px;
+  padding: 8px 10px; display: flex; flex-direction: column; gap: 6px;
+  font-size: 11px; color: #ddd;
+  pointer-events: auto;
+}
+.depth-vals {
+  display: flex; justify-content: space-between;
+  font-variant-numeric: tabular-nums; color: #ccc;
+}
+.depth-vals span { color: #aaa; }
+
+/* Dual-range slider: two <input type=range> stacked on a track. */
+.dual-range {
+  position: relative;
+  width: 180px; height: 22px;
+}
+.dual-range .track {
+  position: absolute; top: 9px; left: 0; right: 0; height: 4px;
+  background: #444; border-radius: 2px;
+}
+.dual-range .fill {
+  position: absolute; top: 9px; height: 4px;
+  background: #c95a2e; border-radius: 2px;
+  pointer-events: none;
+}
+.dual-range input[type=range] {
+  position: absolute; top: 0; left: 0; width: 100%; height: 22px;
+  -webkit-appearance: none; appearance: none;
+  background: transparent; pointer-events: none;
+  margin: 0;
+}
+.dual-range input[type=range]::-webkit-slider-runnable-track {
+  background: transparent; height: 22px;
+}
+.dual-range input[type=range]::-moz-range-track {
+  background: transparent; height: 22px;
+}
+.dual-range input[type=range]::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none;
+  width: 14px; height: 14px; border-radius: 50%;
+  background: #eee; border: 1px solid #888;
+  cursor: pointer; pointer-events: auto;
+  margin-top: 4px;
+}
+.dual-range input[type=range]::-moz-range-thumb {
+  width: 14px; height: 14px; border-radius: 50%;
+  background: #eee; border: 1px solid #888;
+  cursor: pointer; pointer-events: auto;
+}
+/* center handle distinct */
+.dual-range #depth-center::-webkit-slider-thumb {
+  background: #c95a2e; border-color: #fff;
+  width: 12px; height: 12px;
+  margin-top: 5px;
+  cursor: grab;
+}
+.dual-range #depth-center::-moz-range-thumb {
+  background: #c95a2e; border-color: #fff;
+  width: 12px; height: 12px;
+  cursor: grab;
+}
+
+.depth-controls button {
+  background: #333; border: 1px solid #555; color: #eee;
+  padding: 3px 8px; border-radius: 3px; cursor: pointer; font: inherit; font-size: 11px;
+  align-self: flex-end;
+}
+.depth-controls button:hover { background: #444; }
+
+#loading {
+  position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+  background: rgba(26, 26, 26, 0.95); z-index: 100; font-size: 14px;
+}
+#loading.hidden { display: none; }
+
+#status-bar {
+  position: fixed; bottom: 0; left: 0; right: 0;
+  background: #222; border-top: 1px solid #333;
+  padding: 4px 12px; font-size: 11px; color: #888;
+  display: none;
+}
+#status-bar.visible { display: block; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="toolbar">
+    <div class="app-title">CLO × NVIDIA COSMOS</div>
+  </div>
+
+  <aside id="sidebar">
+    <div class="sidebar-header">
+      <span>Settings</span>
+    </div>
+    <div class="sidebar-body">
+      <section class="side-section">
+        <div class="side-section-title">Scene</div>
+        <label class="btn block-btn" for="zprj-file">Upload .zprj…</label>
+        <input type="file" id="zprj-file" accept=".zprj" style="display:none">
+        <div id="zprj-name" class="side-meta"></div>
+      </section>
+      <section class="side-section">
+        <div class="side-section-title">Background</div>
+        <div class="bg-thumbs" id="bg-thumbs"></div>
+      </section>
+      <section class="side-section">
+        <div class="side-section-title">HDR Environment</div>
+        <div class="hdr-thumbs" id="hdr-thumbs"></div>
+        <label class="btn block-btn" for="hdr-file" style="margin-top:8px;">Upload HDR…</label>
+        <input type="file" id="hdr-file" accept=".hdr" style="display:none">
+      </section>
+      <section class="side-section">
+        <button id="render-btn" class="primary-btn">Render</button>
+        <button id="rotate-light-btn" class="block-btn" style="margin-top:6px;">Rotate Light</button>
+      </section>
+    </div>
+  </aside>
+
+  <aside id="rightbar">
+    <div class="sidebar-header"><span>Renders</span></div>
+    <div class="sidebar-body">
+      <div id="gallery" class="gallery"></div>
+    </div>
+  </aside>
+
+  <div id="main">
+    <div class="panel-cell"><div class="panel" id="panel-basecolor">
+      <img class="panel-bg-img" data-buf="basecolor">
+      <div class="panel-canvas-wrap"></div>
+      <span class="panel-label">Basecolor</span>
+    </div></div>
+    <div class="panel-cell"><div class="panel" id="panel-normal">
+      <img class="panel-bg-img" data-buf="normal">
+      <div class="panel-canvas-wrap"></div>
+      <span class="panel-label">Normal</span>
+    </div></div>
+    <div class="panel-cell"><div class="panel" id="panel-depth">
+      <img class="panel-bg-img" data-buf="depth">
+      <div class="panel-canvas-wrap"></div>
+      <span class="panel-label">Depth</span>
+      <div class="depth-controls">
+        <div class="depth-vals">
+          <span id="depth-near-val">near —</span>
+          <span id="depth-far-val">far —</span>
+        </div>
+        <div class="dual-range" id="depth-range">
+          <div class="track"></div>
+          <div class="fill" id="depth-fill"></div>
+          <input type="range" id="depth-near"   min="0" max="1000" step="1" value="200">
+          <input type="range" id="depth-center" min="0" max="1000" step="1" value="400">
+          <input type="range" id="depth-far"    min="0" max="1000" step="1" value="600">
+        </div>
+        <button id="depth-fit">Auto fit</button>
+      </div>
+    </div></div>
+    <div class="panel-cell"><div class="panel" id="panel-roughness">
+      <img class="panel-bg-img" data-buf="roughness">
+      <div class="panel-canvas-wrap"></div>
+      <span class="panel-label">Roughness</span>
+    </div></div>
+  </div>
+</div>
+
+<div id="result-modal">
+  <div id="result-modal-content">
+    <div id="result-modal-header">
+      <div>
+        <div id="result-modal-title">Rendered Result</div>
+        <div id="result-modal-meta"></div>
+      </div>
+      <button id="result-modal-close">Close</button>
+    </div>
+    <img id="result-modal-img" alt="Rendered result">
+    <video id="result-modal-video" autoplay loop muted playsinline style="display:none"></video>
+    <div id="result-modal-gbuffers">
+      <div class="modal-gbuffer" data-buf="basecolor"><span class="label">Basecolor</span><img></div>
+      <div class="modal-gbuffer" data-buf="normal"><span class="label">Normal</span><img></div>
+      <div class="modal-gbuffer" data-buf="depth"><span class="label">Depth</span><img></div>
+      <div class="modal-gbuffer" data-buf="roughness"><span class="label">Roughness</span><img></div>
+    </div>
+    <div id="result-modal-status"></div>
+  </div>
+</div>
+
+<div id="loading">Loading scene...</div>
+<div id="status-bar"></div>
+
+<script type="module" src="/src/main.js"></script>
+</body>
+</html>

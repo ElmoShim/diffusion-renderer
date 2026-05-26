@@ -1,77 +1,39 @@
 
 
-inference_model_weights: './checkpoints/diffusion_renderer-forward-svd'
-# or './checkpoints/diffusion_renderer-forward-svd-objaverse'
+# Cosmos Transfer1 Diffusion Renderer — Forward
+checkpoint_dir: './checkpoints'
+model_checkpoint: 'Diffusion_Renderer_Forward_Cosmos_7B/model.pt'
+tokenizer_dir: 'Cosmos-Tokenize1-CV8x8x8-720p'
 
-inference_res: [ 512, 512 ]
+inference_res: [ 704, 1280 ]
+inference_n_frames: 57
+inference_n_steps: 15
+guidance: 0.0
 
-inference_input_dir: "examples/output_delighting/"
-inference_save_dir: "examples/output_relighting/"
+condition_keys:
+  - basecolor
+  - normal
+  - metallic
+  - roughness
+  - depth
+  - env_ldr
+  - env_log
+  - env_nrm
 
-inference_n_frames: 24
-#overlap_n_frames: 6
-inference_n_steps: 20
-inference_min_guidance_scale: 1.2
-inference_max_guidance_scale: 1.2
+condition_drop_rate: 0.05
+append_condition_mask: true
+env_resolution: [ 704, 1280 ]
 
-model_dtype: fp16
-decode_chunk_size: 8
-cond_mode: 'env' # clip branch for cross attention
-lora_scale: 0.5
+seed: 1000
+
+# Legacy keys kept for render_forward.py compat
 model_pipeline:
-  cond_mode: 'env' # clipimage for cross attention
-  target_image: 'rgb'
+  env_resolution: [ 704, 1280 ]
 
-  cond_images:
-    basecolor: vae
-    normal: vae
-    depth: vae
-    roughness: vae
-    metallic: vae
-    env_ldr: env
-    env_log: env
-    env_nrm: env
-
-  scale_cond_latents: true # NOTE
-  motion_bucket_id: 127
-  fps: 7
-  cond_aug: null
-  cond_sigma_mean: -3.0
-  cond_sigma_std: 0.5
-
-  env_resolution: [ 512, 512 ]
-  unet_kwargs:
-    temporal_cross_attention_dim: null
-    cross_attention_dim: [320, 640, 1280, 1280]
-    multi_res_encoder_hidden_states: true
-    in_channels: 24
-    conv_in_init: zero # additional extend channel is zero init
-    reset_cross_attention: false
-
-#chunk_mode: 'first' # first, all, drop_last
-image_group_mode: "webdataset"  # folder, webdataset
-
-
-envlight:   # string or a list of env map paths
+envlight:
   - "examples/hdri/sunny_vondelpark_1k.hdr"
   - "examples/hdri/pink_sunrise_1k.hdr"
-  # - "examples/hdri/street_lamp_1k.hdr"
-  # - "examples/hdri/circus_arena_1k.hdr"
 
-rotate_light: false
-cam_elevation: 0 # camera elevation angle in degrees
-
-seed: 0
 save_video: true
-save_video_fps: 10
+save_video_fps: 24
 save_image: true
-
-autocast: true
-
-use_deterministic_mode: false
-
-subsample_every_n_frames: 1
-
-use_fixed_frame_ind: false
-fixed_frame_ind: 0
-
