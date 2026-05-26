@@ -6,9 +6,12 @@ import os
 
 import numpy as np
 import torch
-os.environ.setdefault('TORCH_EXTENSIONS_DIR', os.path.join(os.path.dirname(__file__), '..', '.venv', 'torch_extensions'))
-import nvdiffrast.torch as dr
 from PIL import Image
+
+from utils.utils_render_vtk import (
+    render_gbuffers,
+    build_scene_actors,
+)
 
 
 # ── Color helpers ─────────────────────────────────────────────────────
@@ -525,164 +528,6 @@ def _add_background_cylinder(col, n_seg=64, fov_deg=15.0):
     ro_c = np.full(nv_ceil, 0.5, np.float32)
     me_c = np.zeros(nv_ceil, np.float32)
     append_mesh(col, ceil_v, ceil_f, nv_ceil, bc_c, ro_c, me_c)
-
-
-# ── G-buffer rendering ───────────────────────────────────────────────
-
-def _sample_or_interp(tex, scalar, uv, rast, tri, mask, dev, tex_mask=None):
-    attr = scalar if scalar.ndim == 2 else scalar.unsqueeze(-1)
-    if tex is not None:
-        tex_out = dr.texture(tex.to(dev), uv, filter_mode="linear")
-        if tex_out.shape[-1] == 1:
-            tex_out = tex_out.expand(-1, -1, -1, 3)
-        if tex_mask is not None:
-            interp_out, _ = dr.interpolate(attr[None, ...], rast, tri)
-            if interp_out.shape[-1] == 1:
-                interp_out = interp_out.expand(-1, -1, -1, 3)
-            return (tex_out * tex_mask + interp_out * (1 - tex_mask)) * mask
-        return tex_out * mask
-    out, _ = dr.interpolate(attr[None, ...], rast, tri)
-    if out.shape[-1] == 1:
-        out = out.expand(-1, -1, -1, 3)
-    return out * mask
-
-
-def render_gbuffers(mesh, resolution=512, fov_deg=20.0, azimuth_deg=0.0, device="cuda",
-                    _precomp=None):
-    """Render G-buffers for a single viewpoint.
-
-    Returns dict of {name: (H,W,3) float32 tensor in [0,1]}.
-    """
-    pos_np = mesh["positions"]
-    faces_np = mesh["faces"]
-    textures = mesh["textures"]
-
-    if isinstance(resolution, (list, tuple)):
-        res_h, res_w = resolution
-    else:
-        res_h = res_w = resolution
-    aspect = res_w / res_h
-
-    cam_pos = mesh.get("orig_bbox", None)
-    if cam_pos is not None:
-        bmin, bmax = cam_pos
-        cam_ref = np.stack([bmin, bmax])
-    else:
-        cam_ref = pos_np
-    mvp, view, eye = auto_camera(cam_ref, fov_deg, azimuth_deg, aspect=aspect)
-    mvp_t = torch.from_numpy(mvp).to(device)
-    view_t = torch.from_numpy(view).to(device)
-    eye_t = torch.from_numpy(eye).to(device)
-
-    if _precomp is not None:
-        pos, tri, nrm = _precomp["pos"], _precomp["tri"], _precomp["nrm"]
-        uv_t, bc_t = _precomp["uv"], _precomp["bc"]
-        ro_t, me_t = _precomp["ro"], _precomp["me"]
-        pos_h, glctx = _precomp["pos_h"], _precomp["glctx"]
-    else:
-        pos = torch.from_numpy(pos_np).to(device)
-        tri = torch.from_numpy(faces_np.astype(np.int32)).to(device)
-        nrm = torch.from_numpy(compute_vertex_normals(pos_np, faces_np)).float().to(device)
-        uv_t = torch.from_numpy(mesh["uvs"]).float().to(device)
-        bc_t = torch.from_numpy(mesh["basecolors"]).float().to(device)
-        ro_t = torch.from_numpy(mesh["roughness"]).float().to(device)
-        me_t = torch.from_numpy(mesh["metallic"]).float().to(device)
-        pos_h = torch.cat([pos, torch.ones(pos.shape[0], 1, device=device)], 1)
-        glctx = dr.RasterizeCudaContext()
-
-    clip = (pos_h @ mvp_t.T).unsqueeze(0)
-    if isinstance(resolution, (list, tuple)):
-        rast_res = list(resolution)
-    else:
-        rast_res = [resolution, resolution]
-    rast, _ = dr.rasterize(glctx, clip, tri, resolution=rast_res)
-    mask = (rast[..., 3:4] > 0).float()
-
-    # Texture mask: apply textures only to garment faces (first N faces)
-    garment_fc = mesh.get("garment_face_count")
-    tex_mask = None
-    if garment_fc is not None and garment_fc < tri.shape[0]:
-        tri_id = rast[..., 3:4]  # 1-indexed triangle ID
-        tex_mask = ((tri_id > 0) & (tri_id <= garment_fc)).float()
-
-    # Interpolate UVs — flip V, frac for tiling
-    uv_interp, _ = dr.interpolate(uv_t[None, ...], rast, tri)
-    uv_s = uv_interp.clone()
-    uv_s[..., 1] = 1.0 - uv_s[..., 1]
-    uv_s = uv_s.frac()
-
-    gb = {}
-
-    # Normal
-    ni, _ = dr.interpolate(nrm[None, ...], rast, tri)
-    ni = ni / ni.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-    if textures["normal"] is not None:
-        nt = dr.texture(textures["normal"].to(device), uv_s, filter_mode="linear")
-        tn = nt * 2.0 - 1.0
-        tn[..., :2] *= mesh["normal_intensity"]
-        tn = tn / tn.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-        N = ni[0]
-        up_vec = torch.tensor([0., 1., 0.], device=device)
-        T = torch.cross(up_vec.expand_as(N), N, dim=-1)
-        small = T.norm(dim=-1, keepdim=True) < 1e-6
-        fb = torch.cross(torch.tensor([1., 0., 0.], device=device).expand_as(N), N, dim=-1)
-        T[small.expand_as(T)] = fb[small.expand_as(fb)]
-        T = T / T.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-        B = torch.cross(N, T, dim=-1)
-        t = tn[0]
-        perturbed = (t[..., 0:1] * T + t[..., 1:2] * B + t[..., 2:3] * N)
-        perturbed = (perturbed / perturbed.norm(dim=-1, keepdim=True).clamp(min=1e-8)).unsqueeze(0)
-        if tex_mask is not None:
-            ni = perturbed * tex_mask + ni * (1 - tex_mask)
-        else:
-            ni = perturbed
-    world_pos, _ = dr.interpolate(pos_h[None, :, :3].contiguous(), rast, tri)
-    view_dir = world_pos - eye_t
-    view_dir = view_dir / view_dir.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-    dot = (ni * view_dir).sum(dim=-1, keepdim=True)
-    ni = torch.where(dot > 0, -ni, ni)
-    ni_view = ni[..., :3] @ view_t[:3, :3].T
-    ni_view[..., 1] = -ni_view[..., 1]
-    gb["normal"] = ((ni_view * 0.5 + 0.5) * mask)[0]
-
-    # Depth (exclude background faces)
-    orig_fc = mesh.get("orig_face_count")
-    if orig_fc is not None:
-        tri_id = rast[..., 3:4]
-        fg_mask = ((tri_id > 0) & (tri_id <= orig_fc)).float()
-    else:
-        fg_mask = mask
-    cam_z = -(pos_h @ view_t.T)[:, 2:3]
-    cz, _ = dr.interpolate(cam_z[None, ...], rast, tri)
-    valid = cz[fg_mask.bool().expand_as(cz)]
-    if valid.numel() > 0:
-        dn = (cz - valid.min()) / (valid.max() - valid.min() + 1e-8)
-    else:
-        dn = cz
-    gb["depth"] = (dn.clamp(0, 1) * fg_mask + (1 - fg_mask)).expand(-1, -1, -1, 3)[0]
-
-    # Basecolor, Roughness, Metallic
-    gb["basecolor"] = _sample_or_interp(textures["diffuse"], bc_t, uv_s, rast, tri, mask, device, tex_mask)[0]
-    gb["roughness"] = _sample_or_interp(textures["roughness"], ro_t, uv_s, rast, tri, mask, device, tex_mask)[0]
-    gb["metallic"] = _sample_or_interp(textures["metallic"], me_t, uv_s, rast, tri, mask, device, tex_mask)[0]
-
-    return gb
-
-
-def precompute_mesh_gpu(mesh, device="cuda"):
-    """Upload mesh data to GPU once, reuse across multiple render_gbuffers calls."""
-    pos = torch.from_numpy(mesh["positions"]).to(device)
-    tri = torch.from_numpy(mesh["faces"].astype(np.int32)).to(device)
-    nrm = torch.from_numpy(compute_vertex_normals(mesh["positions"], mesh["faces"])).float().to(device)
-    return {
-        "pos": pos, "tri": tri, "nrm": nrm,
-        "uv": torch.from_numpy(mesh["uvs"]).float().to(device),
-        "bc": torch.from_numpy(mesh["basecolors"]).float().to(device),
-        "ro": torch.from_numpy(mesh["roughness"]).float().to(device),
-        "me": torch.from_numpy(mesh["metallic"]).float().to(device),
-        "pos_h": torch.cat([pos, torch.ones(pos.shape[0], 1, device=device)], 1),
-        "glctx": dr.RasterizeCudaContext(),
-    }
 
 
 # ── Save helpers ──────────────────────────────────────────────────────

@@ -13,9 +13,8 @@ import numpy as np
 import torch
 from PIL import Image
 
-from utils.utils_render import (
-    load_mesh, render_gbuffers, save_tensor_as_png,
-)
+from utils.utils_render import save_tensor_as_png
+from utils.utils_render_vtk import render_gbuffers
 
 
 GBUFFER_NAMES = ["basecolor", "normal", "depth", "roughness", "metallic"]
@@ -83,10 +82,8 @@ def main():
     if not scene.valid:
         print(f"Error: {scene.error}")
         return
-    mesh = load_mesh(scene, background=False)
-    print(f"Mesh: {mesh['positions'].shape[0]} verts, {mesh['faces'].shape[0]} tris")
-
-    fg_gb = render_gbuffers(mesh, resolution=res, fov_deg=args.fov, device=args.device)
+    fg_gb = render_gbuffers(scene, resolution=res, fov_deg=args.fov, device=args.device,
+                            background=False)
 
     # 3. Build foreground mask and move bg to same device
     fg_mask = (fg_gb["normal"].sum(dim=-1, keepdim=True) > 0).float()

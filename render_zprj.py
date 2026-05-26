@@ -12,10 +12,8 @@ import os
 
 import torch
 
-from utils.utils_render import (
-    load_mesh, render_gbuffers, precompute_mesh_gpu,
-    save_tensor_as_png, save_video,
-)
+from utils.utils_render import save_tensor_as_png, save_video
+from utils.utils_render_vtk import render_gbuffers, build_scene_actors
 
 
 _model_cache = None
@@ -194,20 +192,21 @@ def main():
     if not scene.valid:
         print(f"Error: {scene.error}")
         return
-    mesh = load_mesh(scene)
-    print(f"Mesh: {mesh['positions'].shape[0]} verts, {mesh['faces'].shape[0]} tris")
+    actors_data = build_scene_actors(scene)
+    print(f"Scene: {len(actors_data)} mesh parts")
 
     # 2. Render G-buffers
     if args.mode == "turntable":
-        precomp = precompute_mesh_gpu(mesh, device=args.device)
         print(f"Rendering {n_frames} turntable frames at {res[0]}x{res[1]}...")
         gbuffers_list = [
-            render_gbuffers(mesh, resolution=res, fov_deg=args.fov,
-                            azimuth_deg=i * 360.0 / n_frames, device=args.device, _precomp=precomp)
+            render_gbuffers(scene, resolution=res, fov_deg=args.fov,
+                            azimuth_deg=i * 360.0 / n_frames, device=args.device,
+                            _actors_data=actors_data)
             for i in range(n_frames)
         ]
     else:
-        gbuffers_list = [render_gbuffers(mesh, resolution=res, fov_deg=args.fov, device=args.device)]
+        gbuffers_list = [render_gbuffers(scene, resolution=res, fov_deg=args.fov,
+                                         device=args.device, _actors_data=actors_data)]
 
     # Save first frame G-buffers
     for name, tensor in gbuffers_list[0].items():
