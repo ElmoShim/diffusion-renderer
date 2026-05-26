@@ -20,6 +20,10 @@ import threading
 import traceback
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 
+import numpy as np
+import torch
+from PIL import Image
+
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 INVERSE_DIR = os.path.join(PROJECT_ROOT, "asset", "inverse")
@@ -30,6 +34,31 @@ GBUFFER_NAMES = ["basecolor", "normal", "depth", "roughness", "metallic"]
 DEFAULT_HDR = os.path.join(PROJECT_ROOT, "examples", "hdri", "sunny_vondelpark_1k.hdr")
 
 _save_lock = threading.Lock()
+_render_lock = threading.Lock()
+_forward_render = None
+
+
+def _resolve_hdr_path(name):
+    """Find an .hdr file by base name in bundled dir or uploads."""
+    if not name:
+        return None
+    fname = name if name.lower().endswith(".hdr") else name + ".hdr"
+    for base in (HDRI_DIR, HDRI_UPLOAD_DIR):
+        path = os.path.join(base, fname)
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def _get_forward_render():
+    """Lazy import forward_render to avoid heavy torch imports at startup."""
+    global _forward_render
+    if _forward_render is None:
+        print("Loading diffusion renderer module (first request)...")
+        from render_zprj import forward_render
+        _forward_render = forward_render
+        print("Diffusion renderer module ready.")
+    return _forward_render
 
 
 def build_web_client(web_dir):
@@ -141,45 +170,87 @@ class Handler(SimpleHTTPRequestHandler):
             save_dir = os.path.join(OUTPUT_DIR, timestamp)
             os.makedirs(save_dir, exist_ok=True)
 
-            saved = []
+            # Save raw PNGs (also keep bytes in memory for inference)
+            gbuf_pngs = {}
             for name in GBUFFER_NAMES:
                 if name in fs:
-                    item = fs[name]
-                    raw = item.file.read()
-                    path = os.path.join(save_dir, f"{name}.png")
-                    with open(path, "wb") as f:
+                    raw = fs[name].file.read()
+                    gbuf_pngs[name] = raw
+                    with open(os.path.join(save_dir, f"{name}.png"), "wb") as f:
                         f.write(raw)
-                    saved.append(name)
-
-            if not saved:
+            if not gbuf_pngs:
                 self._send_text(400, "No G-buffers provided")
                 return
 
+            # Resolve HDR path
+            hdr_path = _resolve_hdr_path(hdr_name) if hdr_name else Handler.hdr_path
+
+            # Decode G-buffers → tensors
+            gbuffers = {}
+            h = w = None
+            for name, raw in gbuf_pngs.items():
+                img = Image.open(io.BytesIO(raw)).convert("RGB")
+                t = torch.from_numpy(np.asarray(img, dtype=np.float32) / 255.0)
+                gbuffers[name] = t
+                if h is None:
+                    h, w = t.shape[:2]
+            # Fill missing G-buffers (e.g. metallic) with zeros, mark as drop_cond
+            drop_conds = []
+            for name in GBUFFER_NAMES:
+                if name not in gbuffers:
+                    gbuffers[name] = torch.zeros(h, w, 3, dtype=torch.float32)
+                    drop_conds.append(name)
+
             meta = {
                 "hdr": hdr_name or None,
+                "hdr_path": os.path.relpath(hdr_path, PROJECT_ROOT) if hdr_path else None,
                 "bg_preset": bg_preset or None,
-                "files": saved,
+                "files": list(gbuf_pngs.keys()),
+                "drop_conds": drop_conds,
+                "resolution": [w, h],
             }
             with open(os.path.join(save_dir, "meta.json"), "w") as f:
                 json.dump(meta, f, indent=2)
 
-            with _save_lock:
-                print(f"[/render] saved {len(saved)} G-buffers → {os.path.relpath(save_dir)} hdr={hdr_name!r} bg={bg_preset!r}")
+            print(f"[/render] inputs saved → {os.path.relpath(save_dir)} ({w}x{h}) hdr={hdr_name!r} drop={drop_conds}")
+            print("[/render] running diffusion forward render...")
 
-            body = json.dumps({
-                "saved_dir": os.path.relpath(save_dir, PROJECT_ROOT),
-                "files": saved,
-                "hdr": hdr_name,
-                "bg_preset": bg_preset,
-            }).encode("utf-8")
+            # Run forward render (serialize — GPU is shared)
+            forward_render = _get_forward_render()
+            result_holder = {"img": None}
+            def on_sample(_i, _seed, frames):
+                result_holder["img"] = frames[0]
+
+            with _render_lock:
+                forward_render(
+                    gbuffers, hdr_path, device=Handler.device,
+                    rotate_light=False, num_samples=1,
+                    on_sample=on_sample,
+                    drop_conds=drop_conds or None,
+                )
+
+            pil_img = result_holder["img"]
+            if pil_img is None:
+                self._send_text(500, "Forward render produced no image")
+                return
+
+            # Save and respond
+            result_path = os.path.join(save_dir, "result.png")
+            pil_img.save(result_path)
+            print(f"[/render] result → {os.path.relpath(result_path)}")
+
+            buf = io.BytesIO()
+            pil_img.save(buf, format="PNG")
+            data = buf.getvalue()
             self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("X-Saved-Dir", os.path.relpath(save_dir, PROJECT_ROOT))
             self.end_headers()
-            self.wfile.write(body)
+            self.wfile.write(data)
         except Exception as e:
             traceback.print_exc()
-            self._send_text(500, f"Save failed: {e}")
+            self._send_text(500, f"Render failed: {e}")
 
     def _handle_upload_hdr(self):
         ctype = self.headers.get("Content-Type", "")

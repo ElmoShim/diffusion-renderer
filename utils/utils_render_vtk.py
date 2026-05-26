@@ -577,6 +577,7 @@ def render_gbuffers(scene, resolution=512, fov_deg=20.0, azimuth_deg=0.0,
     for ad in actors_data:
         mapper = vtk.vtkPolyDataMapper()
         mapper.SetInputData(ad["polydata"])
+        mapper.SetScalarVisibility(False)
         actor = vtk.vtkActor()
         actor.SetMapper(mapper)
         actor.SetShaderProperty(normal_sp)
@@ -589,6 +590,7 @@ def render_gbuffers(scene, resolution=512, fov_deg=20.0, azimuth_deg=0.0,
     for ad in actors_data:
         mapper = vtk.vtkPolyDataMapper()
         mapper.SetInputData(ad["polydata"])
+        mapper.SetScalarVisibility(False)
         actor = vtk.vtkActor()
         actor.SetMapper(mapper)
         ren.AddActor(actor)
@@ -609,6 +611,7 @@ def render_gbuffers(scene, resolution=512, fov_deg=20.0, azimuth_deg=0.0,
     for ad in actors_data:
         mapper = vtk.vtkPolyDataMapper()
         mapper.SetInputData(ad["polydata"])
+        mapper.SetScalarVisibility(False)
         actor = vtk.vtkActor()
         actor.SetMapper(mapper)
         prop = actor.GetProperty()
@@ -635,6 +638,7 @@ def render_gbuffers(scene, resolution=512, fov_deg=20.0, azimuth_deg=0.0,
     for ad in actors_data:
         mapper = vtk.vtkPolyDataMapper()
         mapper.SetInputData(ad["polydata"])
+        mapper.SetScalarVisibility(False)
         actor = vtk.vtkActor()
         actor.SetMapper(mapper)
         prop = actor.GetProperty()

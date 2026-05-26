@@ -10,16 +10,17 @@ html, body { width: 100%; height: 100%; background: #1a1a1a; color: #eee; font-f
 
 #app {
   display: grid;
-  grid-template-columns: 280px 1fr;
+  grid-template-columns: 280px 1fr 140px;
   grid-template-rows: auto 1fr;
   grid-template-areas:
-    "sidebar toolbar"
-    "sidebar main";
+    "sidebar toolbar rightbar"
+    "sidebar main    rightbar";
   width: 100vw; height: 100vh;
 }
-#toolbar { grid-area: toolbar; }
-#main    { grid-area: main; }
-#sidebar { grid-area: sidebar; }
+#toolbar  { grid-area: toolbar; }
+#main     { grid-area: main; }
+#sidebar  { grid-area: sidebar; }
+#rightbar { grid-area: rightbar; }
 
 /* Toolbar */
 #toolbar {
@@ -47,12 +48,19 @@ html, body { width: 100%; height: 100%; background: #1a1a1a; color: #eee; font-f
 .hamburger::before { top: -6px; }
 .hamburger::after  { top: 6px; }
 
-/* Sidebar (always visible, occupies left column) */
+/* Sidebars (always visible) */
 #sidebar {
   background: #1f1f1f; border-right: 1px solid #333;
   display: flex; flex-direction: column;
   min-height: 0;
 }
+#rightbar {
+  background: #1f1f1f; border-left: 1px solid #333;
+  display: flex; flex-direction: column;
+  min-height: 0;
+}
+#rightbar .sidebar-body { padding: 10px; }
+#rightbar .sidebar-header { padding: 10px; }
 .block-btn {
   display: block;
   background: #333; border: 1px solid #555; color: #eee;
@@ -69,6 +77,15 @@ html, body { width: 100%; height: 100%; background: #1a1a1a; color: #eee; font-f
 .primary-btn:hover { background: #d96838; }
 .primary-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 .side-meta { font-size: 11px; color: #888; margin-top: 6px; word-break: break-all; }
+
+.buf-toggles { display: flex; flex-direction: column; gap: 4px; }
+.buf-toggle {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 12px; color: #ddd; cursor: pointer;
+  padding: 3px 6px; border-radius: 3px;
+}
+.buf-toggle:hover { background: #2a2a2a; }
+.buf-toggle input { accent-color: #c95a2e; }
 .sidebar-header {
   display: flex; align-items: center; justify-content: space-between;
   padding: 10px 14px; border-bottom: 1px solid #333;
@@ -125,21 +142,61 @@ html, body { width: 100%; height: 100%; background: #1a1a1a; color: #eee; font-f
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 
-/* Main grid: 2x2 G-buffer fills the area */
+/* Main area: G-buffer panels in an auto-row/col grid driven by JS-set --cols/--rows. */
 #main {
-  flex: 1; min-height: 0;
-  display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr;
+  min-height: 0; min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(var(--cols, 2), 1fr);
+  grid-template-rows: repeat(var(--rows, 2), 1fr);
   gap: 8px; padding: 12px;
   background: #1a1a1a;
+}
+.panel-cell.hidden { display: none; }
+
+/* Gallery (sidebar) */
+.gallery {
+  display: flex; flex-direction: column; gap: 8px;
+}
+.gallery:empty::before {
+  content: 'No renders yet';
+  color: #555; font-size: 11px;
+}
+.gallery-item {
+  position: relative;
+  aspect-ratio: 1280/704;
+  background: #2a2a2a;
+  border: 2px solid #444; border-radius: 4px;
+  cursor: pointer; overflow: hidden;
+  transition: border-color 120ms;
+}
+.gallery-item:hover { border-color: #888; }
+.gallery-item img {
+  position: absolute; inset: 0;
+  width: 100%; height: 100%; object-fit: cover;
+}
+.gallery-item .stamp {
+  position: absolute; bottom: 0; left: 0; right: 0;
+  background: rgba(0,0,0,0.65); color: #ddd;
+  font-size: 10px; padding: 2px 4px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.gallery-item.pending {
+  display: flex; align-items: center; justify-content: center;
+}
+.gallery-item.pending::after {
+  content: ''; width: 16px; height: 16px;
+  border: 2px solid rgba(255,255,255,0.15);
+  border-top-color: #c95a2e; border-radius: 50%;
+  animation: spin 0.8s linear infinite;
 }
 
 /* Result modal */
 #result-modal {
   position: fixed; inset: 0; z-index: 200;
-  background: rgba(0, 0, 0, 0.85);
+  background: rgba(0, 0, 0, 0.88);
   display: none;
   align-items: center; justify-content: center;
-  padding: 32px;
+  padding: 24px;
 }
 #result-modal.visible { display: flex; }
 #result-modal-content {
@@ -147,20 +204,22 @@ html, body { width: 100%; height: 100%; background: #1a1a1a; color: #eee; font-f
   background: #111; border-radius: 8px; padding: 16px;
   max-width: 100%; max-height: 100%;
   display: flex; flex-direction: column; gap: 12px;
+  width: min(96vw, 1600px);
 }
 #result-modal-img {
   display: block;
-  max-width: calc(100vw - 80px);
-  max-height: calc(100vh - 140px);
+  width: 100%;
   aspect-ratio: 1280 / 704;
-  width: auto; height: auto;
+  max-height: calc(100vh - 260px);
   background: #000; border-radius: 4px;
   object-fit: contain;
 }
 #result-modal-header {
   display: flex; align-items: center; justify-content: space-between;
+  gap: 12px;
 }
 #result-modal-title { font-size: 14px; font-weight: 600; color: #eee; }
+#result-modal-meta { font-size: 11px; color: #888; }
 #result-modal-close {
   background: #333; border: 1px solid #555; color: #eee;
   padding: 4px 12px; border-radius: 4px; cursor: pointer;
@@ -171,6 +230,22 @@ html, body { width: 100%; height: 100%; background: #1a1a1a; color: #eee; font-f
   color: #888; font-size: 12px;
   display: flex; align-items: center; gap: 8px;
 }
+#result-modal-gbuffers {
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px;
+}
+.modal-gbuffer {
+  position: relative; aspect-ratio: 1280/704;
+  background: #000; border-radius: 4px; overflow: hidden;
+  cursor: pointer;
+  border: 2px solid transparent;
+}
+.modal-gbuffer:hover { border-color: #c95a2e; }
+.modal-gbuffer img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.modal-gbuffer .label {
+  position: absolute; top: 4px; left: 6px;
+  background: rgba(0,0,0,0.6); color: #fff;
+  font-size: 10px; padding: 1px 5px; border-radius: 2px;
+}
 .spinner {
   width: 14px; height: 14px;
   border: 2px solid rgba(255,255,255,0.15);
@@ -180,7 +255,7 @@ html, body { width: 100%; height: 100%; background: #1a1a1a; color: #eee; font-f
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
-/* Cell wrapper centers the aspect-locked panel inside its grid cell */
+/* Cell wrapper centers the aspect-locked panel inside its cell */
 .panel-cell {
   position: relative;
   min-width: 0; min-height: 0;
@@ -357,6 +432,13 @@ html, body { width: 100%; height: 100%; background: #1a1a1a; color: #eee; font-f
     </div>
   </aside>
 
+  <aside id="rightbar">
+    <div class="sidebar-header"><span>Renders</span></div>
+    <div class="sidebar-body">
+      <div id="gallery" class="gallery"></div>
+    </div>
+  </aside>
+
   <div id="main">
     <div class="panel-cell"><div class="panel" id="panel-basecolor">
       <img class="panel-bg-img" data-buf="basecolor">
@@ -398,10 +480,19 @@ html, body { width: 100%; height: 100%; background: #1a1a1a; color: #eee; font-f
 <div id="result-modal">
   <div id="result-modal-content">
     <div id="result-modal-header">
-      <span id="result-modal-title">Rendered Result</span>
+      <div>
+        <div id="result-modal-title">Rendered Result</div>
+        <div id="result-modal-meta"></div>
+      </div>
       <button id="result-modal-close">Close</button>
     </div>
     <img id="result-modal-img" alt="Rendered result">
+    <div id="result-modal-gbuffers">
+      <div class="modal-gbuffer" data-buf="basecolor"><span class="label">Basecolor</span><img></div>
+      <div class="modal-gbuffer" data-buf="normal"><span class="label">Normal</span><img></div>
+      <div class="modal-gbuffer" data-buf="depth"><span class="label">Depth</span><img></div>
+      <div class="modal-gbuffer" data-buf="roughness"><span class="label">Roughness</span><img></div>
+    </div>
     <div id="result-modal-status"></div>
   </div>
 </div>

@@ -148,7 +148,9 @@ const NORMAL_SHADER = [
     originalValue: '//VTK::Light::Impl',
     replacementValue: `
       vec3 n = normalize(normalVCVSOutput);
-      if (!gl_FrontFacing) n = -n;
+      // Force normal toward camera. In view space, camera looks along -Z
+      // (objects in front have negative z, so the outward normal has z > 0).
+      if (n.z < 0.0) n = -n;
       gl_FragData[0] = vec4(n * 0.5 + 0.5, 1.0);
     `,
     replaceFirst: true,
@@ -391,70 +393,168 @@ function setBackgroundPreset(panels, presetName) {
 
 // ── Render via server ──────────────────────────────────────────────
 
-function showModal(status) {
+// In-memory render history. Latest first.
+const gallery = [];
+
+function fmtTime(d = new Date()) {
+  const p = (n) => String(n).padStart(2, '0');
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+function openModal(item) {
   const modal = document.getElementById('result-modal');
-  const statusEl = document.getElementById('result-modal-status');
   const img = document.getElementById('result-modal-img');
+  const meta = document.getElementById('result-modal-meta');
+  const status = document.getElementById('result-modal-status');
+  const title = document.getElementById('result-modal-title');
+
+  title.textContent = item.resultUrl ? 'Rendered Result' : 'Render (in progress)';
+  meta.textContent = [
+    item.timestamp,
+    item.hdr ? `HDR: ${item.hdr}` : null,
+    item.bg ? `BG: ${item.bg}` : 'BG: none',
+  ].filter(Boolean).join(' · ');
+
+  if (item.resultUrl) {
+    img.src = item.resultUrl;
+    img.style.display = '';
+    status.textContent = '';
+  } else {
+    img.removeAttribute('src');
+    img.style.display = 'none';
+    status.innerHTML = '<span class="spinner"></span><span>Rendering...</span>';
+  }
+
+  // Fill G-buffer thumbs
+  for (const tile of document.querySelectorAll('.modal-gbuffer')) {
+    const buf = tile.dataset.buf;
+    const tileImg = tile.querySelector('img');
+    tileImg.src = item.gbuffers[buf] || '';
+  }
+
   modal.classList.add('visible');
-  img.style.display = 'none';
-  statusEl.innerHTML = `<span class="spinner"></span><span>${status}</span>`;
-}
-
-function setModalStatus(text) {
-  document.getElementById('result-modal-status').innerHTML =
-    `<span class="spinner"></span><span>${text}</span>`;
-}
-
-function setModalResult(url) {
-  const img = document.getElementById('result-modal-img');
-  const statusEl = document.getElementById('result-modal-status');
-  img.src = url;
-  img.style.display = '';
-  statusEl.textContent = '';
-}
-
-function setModalError(msg) {
-  document.getElementById('result-modal-status').innerHTML =
-    `<span style="color:#e66">Error: ${msg}</span>`;
+  modal._activeItem = item;
 }
 
 function hideModal() {
   document.getElementById('result-modal').classList.remove('visible');
 }
 
+function refreshGallery() {
+  const root = document.getElementById('gallery');
+  root.innerHTML = '';
+  for (const item of gallery) {
+    const el = document.createElement('div');
+    el.className = 'gallery-item' + (item.resultUrl ? '' : ' pending');
+    if (item.resultUrl) {
+      const img = document.createElement('img');
+      img.src = item.resultUrl;
+      el.appendChild(img);
+    } else if (item.gbuffers.basecolor) {
+      // While result is loading, show the basecolor capture as placeholder
+      const img = document.createElement('img');
+      img.src = item.gbuffers.basecolor;
+      img.style.opacity = '0.35';
+      el.appendChild(img);
+    }
+    const stamp = document.createElement('div');
+    stamp.className = 'stamp';
+    stamp.textContent = item.timestamp + (item.hdr ? ` · ${item.hdr}` : '');
+    el.appendChild(stamp);
+    el.addEventListener('click', () => openModal(item));
+    root.appendChild(el);
+  }
+}
+
+function setupModalHover() {
+  const big = document.getElementById('result-modal-img');
+  let savedResultSrc = null;
+  for (const tile of document.querySelectorAll('.modal-gbuffer')) {
+    tile.addEventListener('mouseenter', () => {
+      const item = document.getElementById('result-modal')._activeItem;
+      const src = item?.gbuffers[tile.dataset.buf];
+      if (!src) return;
+      if (savedResultSrc === null) savedResultSrc = big.src;
+      big.src = src;
+    });
+    tile.addEventListener('mouseleave', () => {
+      if (savedResultSrc !== null) {
+        big.src = savedResultSrc;
+        savedResultSrc = null;
+      }
+    });
+  }
+}
+
+function makeBlackBlob(w, h) {
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  c.getContext('2d').fillRect(0, 0, w, h); // black by default
+  return new Promise((resolve) => c.toBlob(resolve, 'image/png'));
+}
+
 async function renderViaServer(panels) {
   const renderBtn = document.getElementById('render-btn');
   renderBtn.disabled = true;
-  showModal('Capturing G-buffers...');
+
+  const item = {
+    timestamp: fmtTime(),
+    hdr: activeHdr,
+    bg: activeBgPreset,
+    gbuffers: {},
+    resultUrl: null,
+  };
+  gallery.unshift(item);
+  refreshGallery();
 
   try {
     const formData = new FormData();
     formData.append('hdr', activeHdr);
     if (activeBgPreset) formData.append('bg_preset', activeBgPreset);
-    for (let i = 0; i < panels.length; i++) {
-      const name = GBUFFER_NAMES[i];
-      const dataUrl = await captureAtTargetSize(panels[i]);
+    for (const p of panels) {
+      const name = p.bufName;
+      const dataUrl = await captureAtTargetSize(p);
       const bgUrl = activeBgPreset
         ? `/inverse/${activeBgPreset}/${name}.png`
         : null;
       const blob = await compositeCapture(dataUrl, bgUrl);
+      item.gbuffers[name] = URL.createObjectURL(blob);
       formData.append(name, blob, `${name}.png`);
     }
+    // Always send a black metallic placeholder
+    const metallicBlob = await makeBlackBlob(RENDER_W, RENDER_H);
+    item.gbuffers.metallic = URL.createObjectURL(metallicBlob);
+    formData.append('metallic', metallicBlob, 'metallic.png');
+    refreshGallery();
 
-    setModalStatus('Saving on server...');
     const resp = await fetch('/render', { method: 'POST', body: formData });
     if (!resp.ok) {
       const text = await resp.text();
       throw new Error(`Server error ${resp.status}: ${text}`);
     }
-    const info = await resp.json();
-    const statusEl = document.getElementById('result-modal-status');
-    const img = document.getElementById('result-modal-img');
-    img.style.display = 'none';
-    statusEl.innerHTML = `<span style="color:#9c9">Saved to ${info.saved_dir}/ (${info.files.join(', ')})</span>`;
+    const respCtype = resp.headers.get('Content-Type') || '';
+    if (respCtype.startsWith('image/')) {
+      // Future: server returns the rendered PNG directly
+      const blob = await resp.blob();
+      item.resultUrl = URL.createObjectURL(blob);
+    } else {
+      // Current: server saved files and returned JSON metadata.
+      // Show basecolor capture as the gallery preview.
+      const info = await resp.json();
+      item.savedDir = info.saved_dir;
+      item.resultUrl = item.gbuffers.basecolor;
+    }
+    refreshGallery();
+    // If the user has this item's modal open, refresh it
+    const modal = document.getElementById('result-modal');
+    if (modal.classList.contains('visible') && modal._activeItem === item) {
+      openModal(item);
+    }
   } catch (err) {
     console.error(err);
-    setModalError(err.message);
+    item.error = err.message;
+    refreshGallery();
+    alert('Render failed: ' + err.message);
   } finally {
     renderBtn.disabled = false;
   }
@@ -637,6 +737,10 @@ async function main() {
     createPanel(document.getElementById('panel-depth'), [1, 1, 1]),
     createPanel(document.getElementById('panel-roughness'), [0.5, 0.5, 0.5]),
   ];
+  panels[0].bufName = 'basecolor';
+  panels[1].bufName = 'normal';
+  panels[2].bufName = 'depth';
+  panels[3].bufName = 'roughness';
 
   setStatus('Loading WASM module + sample scene...');
   const scene = await loadZprjFromUrl('/sample.zprj');
@@ -646,6 +750,11 @@ async function main() {
 
   syncCameras(panels);
   autoFitDepth(panels);
+
+  // Fixed 2x2 grid for the 4 G-buffer panels
+  const mainEl = document.getElementById('main');
+  mainEl.style.setProperty('--cols', 2);
+  mainEl.style.setProperty('--rows', 2);
 
   // Depth slider wiring
   document.getElementById('depth-near').addEventListener('input', () => depthSliderChanged(panels, 'near'));
@@ -741,7 +850,7 @@ async function main() {
     renderViaServer(panels);
   });
 
-  // Modal close
+  // Modal close + hover preview
   document.getElementById('result-modal-close').addEventListener('click', hideModal);
   document.getElementById('result-modal').addEventListener('click', (e) => {
     if (e.target.id === 'result-modal') hideModal();
@@ -749,6 +858,8 @@ async function main() {
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') hideModal();
   });
+  setupModalHover();
+  refreshGallery();
 
   // File upload
   const fileInput = document.getElementById('zprj-file');
