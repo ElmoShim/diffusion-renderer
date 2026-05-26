@@ -8,36 +8,121 @@
 * { margin: 0; padding: 0; box-sizing: border-box; }
 html, body { width: 100%; height: 100%; background: #1a1a1a; color: #eee; font-family: system-ui, sans-serif; overflow: hidden; }
 
-#app { display: flex; flex-direction: column; width: 100vw; height: 100vh; }
+#app {
+  display: grid;
+  grid-template-columns: 280px 1fr;
+  grid-template-rows: auto 1fr;
+  grid-template-areas:
+    "sidebar toolbar"
+    "sidebar main";
+  width: 100vw; height: 100vh;
+}
+#toolbar { grid-area: toolbar; }
+#main    { grid-area: main; }
+#sidebar { grid-area: sidebar; }
 
 /* Toolbar */
 #toolbar {
-  display: flex; align-items: center; gap: 16px;
+  display: flex; align-items: center; gap: 12px;
   padding: 10px 16px; background: #222; border-bottom: 1px solid #333;
   flex-shrink: 0;
 }
-#toolbar button, #toolbar label.btn {
+.app-title {
+  font-size: 14px; font-weight: 600; letter-spacing: 0.04em; color: #eee;
+}
+.icon-btn {
+  width: 32px; height: 32px;
+  background: transparent; border: none; color: #ddd;
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer; border-radius: 4px;
+}
+.icon-btn:hover { background: #333; }
+.hamburger, .hamburger::before, .hamburger::after {
+  display: block; width: 18px; height: 2px; background: currentColor; border-radius: 1px;
+}
+.hamburger { position: relative; }
+.hamburger::before, .hamburger::after {
+  content: ''; position: absolute; left: 0;
+}
+.hamburger::before { top: -6px; }
+.hamburger::after  { top: 6px; }
+
+/* Sidebar (always visible, occupies left column) */
+#sidebar {
+  background: #1f1f1f; border-right: 1px solid #333;
+  display: flex; flex-direction: column;
+  min-height: 0;
+}
+.block-btn {
+  display: block;
   background: #333; border: 1px solid #555; color: #eee;
   padding: 6px 14px; border-radius: 4px; cursor: pointer; font: inherit; font-size: 13px;
+  text-align: center; width: 100%;
 }
-#toolbar button:hover, #toolbar label.btn:hover { background: #444; }
-#toolbar button:disabled { opacity: 0.5; cursor: not-allowed; }
-.toolbar-group { display: flex; align-items: center; gap: 8px; }
-.toolbar-label { font-size: 12px; color: #999; margin-right: 4px; }
+.block-btn:hover { background: #444; }
+.primary-btn {
+  display: block; width: 100%;
+  background: #c95a2e; border: 1px solid #c95a2e; color: #fff;
+  padding: 8px 14px; border-radius: 4px; cursor: pointer;
+  font: inherit; font-size: 13px; font-weight: 600;
+}
+.primary-btn:hover { background: #d96838; }
+.primary-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.side-meta { font-size: 11px; color: #888; margin-top: 6px; word-break: break-all; }
+.sidebar-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 14px; border-bottom: 1px solid #333;
+  font-size: 13px; font-weight: 600;
+}
+.sidebar-header button {
+  background: transparent; border: none; color: #aaa;
+  font-size: 22px; cursor: pointer; line-height: 1; padding: 0 4px;
+}
+.sidebar-header button:hover { color: #fff; }
+.sidebar-body {
+  flex: 1; overflow-y: auto;
+  padding: 14px;
+  display: flex; flex-direction: column; gap: 18px;
+}
+.side-section-title {
+  font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em;
+  color: #888; margin-bottom: 6px;
+}
+.upload-hdr {
+  display: inline-block; padding: 5px 10px;
+  background: #333; border: 1px solid #555; color: #eee;
+  border-radius: 4px; cursor: pointer; font-size: 12px;
+}
+.upload-hdr:hover { background: #444; }
 
-/* Bg preset thumbnails */
-.bg-thumbs { display: flex; gap: 6px; }
-.bg-thumb {
-  width: 80px; height: 44px;
+/* Bg + HDR preset thumbnails */
+.bg-thumbs, .hdr-thumbs {
+  display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px;
+}
+.bg-thumb, .hdr-thumb {
+  aspect-ratio: 16/9;
   background-size: cover; background-position: center;
   border: 2px solid #444; border-radius: 4px; cursor: pointer;
   transition: border-color 120ms;
+  position: relative;
+  overflow: hidden;
 }
-.bg-thumb:hover { border-color: #888; }
-.bg-thumb.active { border-color: #c95a2e; }
+.bg-thumb:hover, .hdr-thumb:hover { border-color: #888; }
+.bg-thumb.active, .hdr-thumb.active { border-color: #c95a2e; }
 .bg-thumb.clear {
   background: #2a2a2a; display: flex; align-items: center; justify-content: center;
   font-size: 11px; color: #888;
+}
+.hdr-thumb { background: #2a2a2a; }
+.hdr-thumb canvas, .hdr-thumb img {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  display: block; object-fit: cover;
+}
+.hdr-thumb .name {
+  position: absolute; bottom: 0; left: 0; right: 0;
+  background: rgba(0,0,0,0.6); color: #ddd;
+  font-size: 10px; padding: 2px 4px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 
 /* Main grid: 2x2 G-buffer fills the area */
@@ -242,20 +327,35 @@ html, body { width: 100%; height: 100%; background: #1a1a1a; color: #eee; font-f
 <body>
 <div id="app">
   <div id="toolbar">
-    <div class="toolbar-group">
-      <label class="btn" for="zprj-file">Upload .zprj</label>
-      <input type="file" id="zprj-file" accept=".zprj" style="display:none">
-      <span id="zprj-name" class="toolbar-label"></span>
-    </div>
-    <div class="toolbar-group">
-      <span class="toolbar-label">Background:</span>
-      <div class="bg-thumbs" id="bg-thumbs"></div>
-    </div>
-    <div style="flex:1"></div>
-    <div class="toolbar-group">
-      <button id="render-btn">Render</button>
-    </div>
+    <div class="app-title">CLO × NVIDIA COSMOS</div>
   </div>
+
+  <aside id="sidebar">
+    <div class="sidebar-header">
+      <span>Settings</span>
+    </div>
+    <div class="sidebar-body">
+      <section class="side-section">
+        <div class="side-section-title">Scene</div>
+        <label class="btn block-btn" for="zprj-file">Upload .zprj…</label>
+        <input type="file" id="zprj-file" accept=".zprj" style="display:none">
+        <div id="zprj-name" class="side-meta"></div>
+      </section>
+      <section class="side-section">
+        <div class="side-section-title">Background</div>
+        <div class="bg-thumbs" id="bg-thumbs"></div>
+      </section>
+      <section class="side-section">
+        <div class="side-section-title">HDR Environment</div>
+        <div class="hdr-thumbs" id="hdr-thumbs"></div>
+        <label class="btn block-btn" for="hdr-file" style="margin-top:8px;">Upload HDR…</label>
+        <input type="file" id="hdr-file" accept=".hdr" style="display:none">
+      </section>
+      <section class="side-section">
+        <button id="render-btn" class="primary-btn">Render</button>
+      </section>
+    </div>
+  </aside>
 
   <div id="main">
     <div class="panel-cell"><div class="panel" id="panel-basecolor">

@@ -6,13 +6,16 @@ import vtkMapper from '@kitware/vtk.js/Rendering/Core/Mapper';
 import {
   buildSceneActors, buildFloorDisc, computeForegroundBounds,
 } from './geometry.js';
+import { decodeRGBE, tonemapToImageData } from './rgbe.js';
 
 const RENDER_W = 1280;
 const RENDER_H = 704;
 const BG_PRESETS = ['image_1', 'image_2', 'image_5', 'image_10'];
+const HDR_PRESETS = ['sunny_vondelpark_1k', 'pink_sunrise_1k', 'street_lamp_1k', 'circus_arena_1k'];
 const GBUFFER_NAMES = ['basecolor', 'normal', 'depth', 'roughness'];
 
 let activeBgPreset = null;
+let activeHdr = HDR_PRESETS[0];
 let currentActorsData = null;
 
 function setShaderReplacements(mapper, replacements) {
@@ -335,6 +338,32 @@ async function compositeCapture(captureDataUrl, bgUrl) {
   return new Promise((resolve) => canvas.toBlob(resolve, 'image/png'));
 }
 
+// ── HDR thumbnail decode ────────────────────────────────────────────
+
+function hdrBufferToCanvas(arrayBuffer, maxW = 256) {
+  const hdr = decodeRGBE(arrayBuffer);
+  const full = document.createElement('canvas');
+  full.width = hdr.width;
+  full.height = hdr.height;
+  const fctx = full.getContext('2d');
+  fctx.putImageData(tonemapToImageData(hdr), 0, 0);
+  // Downscale to thumbnail size for memory
+  const scale = Math.min(1, maxW / hdr.width);
+  const w = Math.round(hdr.width * scale);
+  const h = Math.round(hdr.height * scale);
+  const thumb = document.createElement('canvas');
+  thumb.width = w; thumb.height = h;
+  thumb.getContext('2d').drawImage(full, 0, 0, w, h);
+  return thumb;
+}
+
+async function decodeHdrToCanvas(url) {
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`fetch ${url} → ${resp.status}`);
+  const buf = await resp.arrayBuffer();
+  return hdrBufferToCanvas(buf);
+}
+
 // ── Background preset ──────────────────────────────────────────────
 
 function setBackgroundPreset(panels, presetName) {
@@ -400,6 +429,8 @@ async function renderViaServer(panels) {
 
   try {
     const formData = new FormData();
+    formData.append('hdr', activeHdr);
+    if (activeBgPreset) formData.append('bg_preset', activeBgPreset);
     for (let i = 0; i < panels.length; i++) {
       const name = GBUFFER_NAMES[i];
       const dataUrl = await captureAtTargetSize(panels[i]);
@@ -573,13 +604,15 @@ function autoFitDepth(panels) {
   const depthPanel = panels[2];
   const range = computeFocalRelativeZRange(depthPanel, currentActorsData);
   if (!range) return;
-  const pad = (range.far - range.near) * 0.05;
-  const near = range.near - pad;
-  const far = range.far + pad;
+  // Expand fitted range to 6× around its center (2× of previous 3×)
+  const center = (range.near + range.far) / 2;
+  const halfFit = (range.far - range.near) / 2;
+  const near = center - halfFit * 6;
+  const far = center + halfFit * 6;
   const delta = far - near;
-  // Slider scale: ±1× the fitted range around it
-  depthSlider.min = near - delta;
-  depthSlider.max = far + delta;
+  // Slider domain: ±3× the (expanded) range
+  depthSlider.min = near - delta * 3;
+  depthSlider.max = far + delta * 3;
   depthState.near = near;
   depthState.far = far;
   const nv = distToSlider(near);
@@ -641,6 +674,66 @@ async function main() {
     for (const sib of thumbs.children) sib.classList.remove('active');
     t.classList.add('active');
     setBackgroundPreset(panels, t.dataset.preset || null);
+  });
+
+  // HDR gallery (sidebar)
+  const hdrThumbs = document.getElementById('hdr-thumbs');
+  for (const name of HDR_PRESETS) {
+    const div = document.createElement('div');
+    div.className = 'hdr-thumb';
+    if (name === activeHdr) div.classList.add('active');
+    div.dataset.hdr = name;
+    div.innerHTML = `<div class="name">${name}</div>`;
+    hdrThumbs.appendChild(div);
+    // Async decode + render preview
+    decodeHdrToCanvas(`/hdri/${name}.hdr`)
+      .then((canvas) => {
+        // Replace the .name child's preceding spot
+        div.insertBefore(canvas, div.firstChild);
+      })
+      .catch((err) => {
+        console.warn('HDR thumb failed', name, err);
+        div.querySelector('.name').textContent = `${name} (failed)`;
+      });
+  }
+  hdrThumbs.addEventListener('click', (e) => {
+    const t = e.target.closest('.hdr-thumb');
+    if (!t) return;
+    for (const sib of hdrThumbs.children) sib.classList.remove('active');
+    t.classList.add('active');
+    activeHdr = t.dataset.hdr;
+  });
+
+  // HDR upload (POST to server, also add to client gallery)
+  document.getElementById('hdr-file').addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const baseName = file.name.replace(/\.hdr$/i, '');
+    try {
+      const form = new FormData();
+      form.append('hdr', file, file.name);
+      const resp = await fetch('/upload_hdr', { method: 'POST', body: form });
+      if (!resp.ok) throw new Error(`Upload failed: ${resp.status}`);
+      const info = await resp.json();
+      const hdrName = info.name || baseName;
+      // Add to client gallery
+      const div = document.createElement('div');
+      div.className = 'hdr-thumb';
+      div.dataset.hdr = hdrName;
+      div.innerHTML = `<div class="name">${hdrName}</div>`;
+      hdrThumbs.appendChild(div);
+      const buf = await file.arrayBuffer();
+      const canvas = hdrBufferToCanvas(buf);
+      div.insertBefore(canvas, div.firstChild);
+      // Auto-select
+      for (const sib of hdrThumbs.children) sib.classList.remove('active');
+      div.classList.add('active');
+      activeHdr = hdrName;
+    } catch (err) {
+      console.error(err);
+      alert('HDR upload failed: ' + err.message);
+    }
+    e.target.value = '';
   });
 
   // Render button
