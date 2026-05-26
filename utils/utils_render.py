@@ -152,29 +152,33 @@ def look_at(eye, target, up):
     return m
 
 
-def perspective(fov_deg, near, far):
+def perspective(fov_deg, near, far, aspect=1.0):
     t = math.tan(math.radians(fov_deg) / 2.0)
     p = np.zeros((4, 4), dtype=np.float32)
-    p[0, 0] = 1.0 / t; p[1, 1] = 1.0 / t
+    p[0, 0] = 1.0 / (t * aspect)
+    p[1, 1] = 1.0 / t
     p[2, 2] = -(far + near) / (far - near)
     p[2, 3] = -2.0 * far * near / (far - near)
     p[3, 2] = -1.0
     return p
 
 
-def auto_camera(positions, fov_deg=15.0, azimuth_deg=0.0):
+def auto_camera(positions, fov_deg=15.0, azimuth_deg=0.0, aspect=1.0):
     """Camera that orbits around the mesh center at the given azimuth angle."""
     center = (positions.max(0) + positions.min(0)) / 2.0
-    ext = (positions.max(0) - positions.min(0)).max()
-    dist = (ext / 2.0) / math.tan(math.radians(fov_deg) / 2.0) * 1.2
+    span = positions.max(0) - positions.min(0)
+    half_fov = math.radians(fov_deg) / 2.0
+    dist_y = (span[1] / 2.0) / math.tan(half_fov)
+    dist_x = (span[0] / 2.0) / math.tan(half_fov * aspect)
+    dist = max(dist_y, dist_x) * 1.05
     az = math.radians(azimuth_deg)
     eye = center + np.array([math.sin(az) * dist, 0, math.cos(az) * dist], dtype=np.float32)
     up = np.array([0, -1, 0], dtype=np.float32)
-    near = max(dist - ext, 0.1)
-    far = dist + ext
+    near = max(dist - span.max(), 0.1)
+    far = dist * 2.5
     view = look_at(eye, center, up)
-    proj = perspective(fov_deg, near, far)
-    return proj @ view, view
+    proj = perspective(fov_deg, near, far, aspect=aspect)
+    return proj @ view, view, eye
 
 
 # ── Material helpers ──────────────────────────────────────────────────
@@ -434,10 +438,92 @@ def load_mesh(scene):
     if btn_count:
         print(f"  Button meshes: {btn_count}")
 
+    # ── 6. Background cylinder ──────────────────────────────────────
+    orig_pos = np.concatenate(col["pos"])
+    orig_bbox = (orig_pos.min(0), orig_pos.max(0))
+    orig_face_count = sum(f.shape[0] for f in col["faces"])
+    _add_background_cylinder(col)
+
     # ── Assemble ─────────────────────────────────────────────────────
     textures = {k: tex_to_tensor(v, 3 if k not in ("roughness", "metallic") else 1)
                 for k, v in tex_bytes.items()}
-    return assemble_mesh(col, textures, normal_intensity, garment_face_count)
+    m = assemble_mesh(col, textures, normal_intensity, garment_face_count)
+    m["orig_bbox"] = orig_bbox
+    m["orig_face_count"] = orig_face_count
+    return m
+
+
+def _add_background_cylinder(col, n_seg=64, fov_deg=15.0):
+    """Add a closed cylinder (wall + floor + ceiling) enclosing the current mesh.
+    Radius is set larger than the camera distance so the camera sits inside."""
+    all_pos = np.concatenate(col["pos"])
+    bmin, bmax = all_pos.min(0), all_pos.max(0)
+    center_xz = (bmin[[0, 2]] + bmax[[0, 2]]) / 2.0
+    height = bmax[1] - bmin[1]
+
+    span_x = bmax[0] - bmin[0]
+    half_fov = math.radians(fov_deg) / 2.0
+    cam_dist = max(height / 2.0 / math.tan(half_fov),
+                   span_x / 2.0 / math.tan(half_fov)) * 1.05
+    radius = cam_dist * 1.1
+    y_floor = bmin[1]
+    y_top = bmax[1] + height * 0.6
+    cx, cz = center_xz
+
+    angles = np.linspace(0, 2 * np.pi, n_seg, endpoint=False, dtype=np.float32)
+    cos_a, sin_a = np.cos(angles), np.sin(angles)
+
+    # Wall: 2 rings of vertices (bottom + top)
+    wall_bot = np.stack([cx + radius * cos_a, np.full(n_seg, y_floor), cz + radius * sin_a], axis=1)
+    wall_top = np.stack([cx + radius * cos_a, np.full(n_seg, y_top), cz + radius * sin_a], axis=1)
+    wall_v = np.concatenate([wall_bot, wall_top]).astype(np.float32)
+
+    wall_f = []
+    for i in range(n_seg):
+        j = (i + 1) % n_seg
+        wall_f.append([i, j, j + n_seg])
+        wall_f.append([i, j + n_seg, i + n_seg])
+    wall_f = np.array(wall_f, np.int32)
+
+    nv_wall = wall_v.shape[0]
+    bc = np.full((nv_wall, 3), 0.5, np.float32)
+    ro = np.full(nv_wall, 0.5, np.float32)
+    me = np.zeros(nv_wall, np.float32)
+    append_mesh(col, wall_v, wall_f, nv_wall, bc, ro, me)
+
+    # Floor disc: center vertex + ring
+    floor_center = np.array([[cx, y_floor, cz]], np.float32)
+    floor_ring = np.stack([cx + radius * cos_a, np.full(n_seg, y_floor), cz + radius * sin_a], axis=1)
+    floor_v = np.concatenate([floor_center, floor_ring]).astype(np.float32)
+
+    floor_f = []
+    for i in range(n_seg):
+        j = (i + 1) % n_seg
+        floor_f.append([0, j + 1, i + 1])
+    floor_f = np.array(floor_f, np.int32)
+
+    nv_floor = floor_v.shape[0]
+    bc_f = np.full((nv_floor, 3), 0.5, np.float32)
+    ro_f = np.full(nv_floor, 0.5, np.float32)
+    me_f = np.zeros(nv_floor, np.float32)
+    append_mesh(col, floor_v, floor_f, nv_floor, bc_f, ro_f, me_f)
+
+    # Ceiling disc
+    ceil_center = np.array([[cx, y_top, cz]], np.float32)
+    ceil_ring = np.stack([cx + radius * cos_a, np.full(n_seg, y_top), cz + radius * sin_a], axis=1)
+    ceil_v = np.concatenate([ceil_center, ceil_ring]).astype(np.float32)
+
+    ceil_f = []
+    for i in range(n_seg):
+        j = (i + 1) % n_seg
+        ceil_f.append([0, j + 1, i + 1])
+    ceil_f = np.array(ceil_f, np.int32)
+
+    nv_ceil = ceil_v.shape[0]
+    bc_c = np.full((nv_ceil, 3), 0.5, np.float32)
+    ro_c = np.full(nv_ceil, 0.5, np.float32)
+    me_c = np.zeros(nv_ceil, np.float32)
+    append_mesh(col, ceil_v, ceil_f, nv_ceil, bc_c, ro_c, me_c)
 
 
 # ── G-buffer rendering ───────────────────────────────────────────────
@@ -460,7 +546,7 @@ def _sample_or_interp(tex, scalar, uv, rast, tri, mask, dev, tex_mask=None):
     return out * mask
 
 
-def render_gbuffers(mesh, resolution=512, fov_deg=15.0, azimuth_deg=0.0, device="cuda",
+def render_gbuffers(mesh, resolution=512, fov_deg=20.0, azimuth_deg=0.0, device="cuda",
                     _precomp=None):
     """Render G-buffers for a single viewpoint.
 
@@ -470,9 +556,22 @@ def render_gbuffers(mesh, resolution=512, fov_deg=15.0, azimuth_deg=0.0, device=
     faces_np = mesh["faces"]
     textures = mesh["textures"]
 
-    mvp, view = auto_camera(pos_np, fov_deg, azimuth_deg)
+    if isinstance(resolution, (list, tuple)):
+        res_h, res_w = resolution
+    else:
+        res_h = res_w = resolution
+    aspect = res_w / res_h
+
+    cam_pos = mesh.get("orig_bbox", None)
+    if cam_pos is not None:
+        bmin, bmax = cam_pos
+        cam_ref = np.stack([bmin, bmax])
+    else:
+        cam_ref = pos_np
+    mvp, view, eye = auto_camera(cam_ref, fov_deg, azimuth_deg, aspect=aspect)
     mvp_t = torch.from_numpy(mvp).to(device)
     view_t = torch.from_numpy(view).to(device)
+    eye_t = torch.from_numpy(eye).to(device)
 
     if _precomp is not None:
         pos, tri, nrm = _precomp["pos"], _precomp["tri"], _precomp["nrm"]
@@ -491,7 +590,11 @@ def render_gbuffers(mesh, resolution=512, fov_deg=15.0, azimuth_deg=0.0, device=
         glctx = dr.RasterizeCudaContext()
 
     clip = (pos_h @ mvp_t.T).unsqueeze(0)
-    rast, _ = dr.rasterize(glctx, clip, tri, resolution=[resolution, resolution])
+    if isinstance(resolution, (list, tuple)):
+        rast_res = list(resolution)
+    else:
+        rast_res = [resolution, resolution]
+    rast, _ = dr.rasterize(glctx, clip, tri, resolution=rast_res)
     mask = (rast[..., 3:4] > 0).float()
 
     # Texture mask: apply textures only to garment faces (first N faces)
@@ -532,17 +635,30 @@ def render_gbuffers(mesh, resolution=512, fov_deg=15.0, azimuth_deg=0.0, device=
             ni = perturbed * tex_mask + ni * (1 - tex_mask)
         else:
             ni = perturbed
-    gb["normal"] = ((ni * 0.5 + 0.5) * mask)[0]
+    world_pos, _ = dr.interpolate(pos_h[None, :, :3].contiguous(), rast, tri)
+    view_dir = world_pos - eye_t
+    view_dir = view_dir / view_dir.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+    dot = (ni * view_dir).sum(dim=-1, keepdim=True)
+    ni = torch.where(dot > 0, -ni, ni)
+    ni_view = ni[..., :3] @ view_t[:3, :3].T
+    ni_view[..., 1] = -ni_view[..., 1]
+    gb["normal"] = ((ni_view * 0.5 + 0.5) * mask)[0]
 
-    # Depth
+    # Depth (exclude background faces)
+    orig_fc = mesh.get("orig_face_count")
+    if orig_fc is not None:
+        tri_id = rast[..., 3:4]
+        fg_mask = ((tri_id > 0) & (tri_id <= orig_fc)).float()
+    else:
+        fg_mask = mask
     cam_z = -(pos_h @ view_t.T)[:, 2:3]
     cz, _ = dr.interpolate(cam_z[None, ...], rast, tri)
-    valid = cz[mask.bool().expand_as(cz)]
+    valid = cz[fg_mask.bool().expand_as(cz)]
     if valid.numel() > 0:
         dn = (cz - valid.min()) / (valid.max() - valid.min() + 1e-8)
     else:
         dn = cz
-    gb["depth"] = (dn.clamp(0, 1) * mask + (1 - mask)).expand(-1, -1, -1, 3)[0]
+    gb["depth"] = (dn.clamp(0, 1) * fg_mask + (1 - fg_mask)).expand(-1, -1, -1, 3)[0]
 
     # Basecolor, Roughness, Metallic
     gb["basecolor"] = _sample_or_interp(textures["diffuse"], bc_t, uv_s, rast, tri, mask, device, tex_mask)[0]
