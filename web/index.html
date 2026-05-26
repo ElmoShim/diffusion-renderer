@@ -152,6 +152,78 @@ html, body { width: 100%; height: 100%; background: #1a1a1a; color: #eee; font-f
   pointer-events: none;
 }
 
+/* Depth controls overlay */
+.depth-controls {
+  position: absolute; top: 6px; right: 8px; z-index: 10;
+  background: rgba(0, 0, 0, 0.55); border-radius: 4px;
+  padding: 8px 10px; display: flex; flex-direction: column; gap: 6px;
+  font-size: 11px; color: #ddd;
+  pointer-events: auto;
+}
+.depth-vals {
+  display: flex; justify-content: space-between;
+  font-variant-numeric: tabular-nums; color: #ccc;
+}
+.depth-vals span { color: #aaa; }
+
+/* Dual-range slider: two <input type=range> stacked on a track. */
+.dual-range {
+  position: relative;
+  width: 180px; height: 22px;
+}
+.dual-range .track {
+  position: absolute; top: 9px; left: 0; right: 0; height: 4px;
+  background: #444; border-radius: 2px;
+}
+.dual-range .fill {
+  position: absolute; top: 9px; height: 4px;
+  background: #c95a2e; border-radius: 2px;
+  pointer-events: none;
+}
+.dual-range input[type=range] {
+  position: absolute; top: 0; left: 0; width: 100%; height: 22px;
+  -webkit-appearance: none; appearance: none;
+  background: transparent; pointer-events: none;
+  margin: 0;
+}
+.dual-range input[type=range]::-webkit-slider-runnable-track {
+  background: transparent; height: 22px;
+}
+.dual-range input[type=range]::-moz-range-track {
+  background: transparent; height: 22px;
+}
+.dual-range input[type=range]::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none;
+  width: 14px; height: 14px; border-radius: 50%;
+  background: #eee; border: 1px solid #888;
+  cursor: pointer; pointer-events: auto;
+  margin-top: 4px;
+}
+.dual-range input[type=range]::-moz-range-thumb {
+  width: 14px; height: 14px; border-radius: 50%;
+  background: #eee; border: 1px solid #888;
+  cursor: pointer; pointer-events: auto;
+}
+/* center handle distinct */
+.dual-range #depth-center::-webkit-slider-thumb {
+  background: #c95a2e; border-color: #fff;
+  width: 12px; height: 12px;
+  margin-top: 5px;
+  cursor: grab;
+}
+.dual-range #depth-center::-moz-range-thumb {
+  background: #c95a2e; border-color: #fff;
+  width: 12px; height: 12px;
+  cursor: grab;
+}
+
+.depth-controls button {
+  background: #333; border: 1px solid #555; color: #eee;
+  padding: 3px 8px; border-radius: 3px; cursor: pointer; font: inherit; font-size: 11px;
+  align-self: flex-end;
+}
+.depth-controls button:hover { background: #444; }
+
 #loading {
   position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
   background: rgba(26, 26, 26, 0.95); z-index: 100; font-size: 14px;
@@ -200,6 +272,20 @@ html, body { width: 100%; height: 100%; background: #1a1a1a; color: #eee; font-f
       <img class="panel-bg-img" data-buf="depth">
       <div class="panel-canvas-wrap"></div>
       <span class="panel-label">Depth</span>
+      <div class="depth-controls">
+        <div class="depth-vals">
+          <span id="depth-near-val">near —</span>
+          <span id="depth-far-val">far —</span>
+        </div>
+        <div class="dual-range" id="depth-range">
+          <div class="track"></div>
+          <div class="fill" id="depth-fill"></div>
+          <input type="range" id="depth-near"   min="0" max="1000" step="1" value="200">
+          <input type="range" id="depth-center" min="0" max="1000" step="1" value="400">
+          <input type="range" id="depth-far"    min="0" max="1000" step="1" value="600">
+        </div>
+        <button id="depth-fit">Auto fit</button>
+      </div>
     </div></div>
     <div class="panel-cell"><div class="panel" id="panel-roughness">
       <img class="panel-bg-img" data-buf="roughness">

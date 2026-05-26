@@ -13,6 +13,7 @@ const BG_PRESETS = ['image_1', 'image_2', 'image_5', 'image_10'];
 const GBUFFER_NAMES = ['basecolor', 'normal', 'depth', 'roughness'];
 
 let activeBgPreset = null;
+let currentActorsData = null;
 
 function setShaderReplacements(mapper, replacements) {
   const vsp = mapper.getViewSpecificProperties();
@@ -151,17 +152,56 @@ const NORMAL_SHADER = [
   },
 ];
 
+// Depth state: absolute view-space distances (positive units).
+// Output = 1 - clamp((dist-near)/(far-near), 0, 1)  → 1=near, 0=far
+const depthState = { near: 1, far: 100 };
+// Slider scale: 0..SLIDER_MAX maps to [sliderMin, sliderMax] (view-space units).
+// Set by autoFitDepth: ±5× the fitted range gives the user room around it.
+const depthSlider = { min: 0, max: 100 };
+
+// near/far are expressed in focal-relative units (0 = focal point).
+// Effective range = [focalDist + near, focalDist + far].
 const DEPTH_SHADER = [
+  {
+    shaderType: 'Fragment',
+    originalValue: '//VTK::Light::Dec',
+    replacementValue: `
+      //VTK::Light::Dec
+      uniform float u_depthNear;
+      uniform float u_depthFar;
+      uniform float u_focalDist;
+    `,
+    replaceFirst: true,
+  },
   {
     shaderType: 'Fragment',
     originalValue: '//VTK::Light::Impl',
     replacementValue: `
-      float d = gl_FragCoord.z;
+      float distFromFocal = (-vertexVCVSOutput.z) - u_focalDist;
+      float d = clamp((distFromFocal - u_depthNear) / max(u_depthFar - u_depthNear, 1e-6), 0.0, 1.0);
       gl_FragData[0] = vec4(vec3(d), 1.0);
     `,
     replaceFirst: true,
   },
 ];
+
+function addDepthUniformCallback(mapper) {
+  const vsp = mapper.getViewSpecificProperties();
+  vsp.ShadersCallbacks = vsp.ShadersCallbacks || [];
+  vsp.ShadersCallbacks.push({
+    callback: (_userData, cellBO, ren) => {
+      const prog = cellBO.getProgram();
+      const cam = ren.getActiveCamera();
+      const pos = cam.getPosition();
+      const fp = cam.getFocalPoint();
+      const dx = fp[0] - pos[0], dy = fp[1] - pos[1], dz = fp[2] - pos[2];
+      const focalDist = Math.sqrt(dx * dx + dy * dy + dz * dz) || 1;
+      if (prog.isUniformUsed('u_depthNear')) prog.setUniformf('u_depthNear', depthState.near);
+      if (prog.isUniformUsed('u_depthFar')) prog.setUniformf('u_depthFar', depthState.far);
+      if (prog.isUniformUsed('u_focalDist')) prog.setUniformf('u_focalDist', focalDist);
+    },
+  });
+}
 
 // ── Floor helper ────────────────────────────────────────────────────
 
@@ -216,11 +256,14 @@ function populateDepth(renderer, actorsData, floorPD) {
     const mapper = vtkMapper.newInstance();
     mapper.setInputData(ad.polyData);
     setShaderReplacements(mapper, DEPTH_SHADER);
+    addDepthUniformCallback(mapper);
     const actor = vtkActor.newInstance();
     actor.setMapper(mapper);
     renderer.addActor(actor);
   }
-  return addFloorActor(renderer, floorPD, [1, 1, 1], DEPTH_SHADER);
+  const floorActor = addFloorActor(renderer, floorPD, [1, 1, 1], DEPTH_SHADER);
+  if (floorActor) addDepthUniformCallback(floorActor.getMapper());
+  return floorActor;
 }
 
 function populateRoughness(renderer, actorsData, floorPD) {
@@ -390,6 +433,7 @@ async function renderViaServer(panels) {
 
 async function buildAndPopulate(scene, panels) {
   const actorsData = await buildSceneActors(scene);
+  currentActorsData = actorsData;
   const floorPD = buildFloorDisc(actorsData);
 
   // Clear existing actors
@@ -405,6 +449,145 @@ async function buildAndPopulate(scene, panels) {
 
   frameCameras(panels, actorsData);
   for (const p of panels) p.renderWindow.render();
+}
+
+// ── Depth UI ────────────────────────────────────────────────────────
+
+// Slider value (0..SLIDER_MAX) maps linearly to [depthSlider.min, depthSlider.max].
+const SLIDER_MAX = 1000;
+const MIN_GAP = 5;
+
+function sliderToDist(v) {
+  return depthSlider.min + (v / SLIDER_MAX) * (depthSlider.max - depthSlider.min);
+}
+function distToSlider(d) {
+  const span = depthSlider.max - depthSlider.min;
+  if (span <= 0) return 0;
+  return Math.round(((d - depthSlider.min) / span) * SLIDER_MAX);
+}
+
+function writeSliders(nv, cv, fv) {
+  document.getElementById('depth-near').value = nv;
+  document.getElementById('depth-center').value = cv;
+  document.getElementById('depth-far').value = fv;
+}
+
+function updateDepthFill() {
+  const nearEl = document.getElementById('depth-near');
+  const farEl = document.getElementById('depth-far');
+  const centerEl = document.getElementById('depth-center');
+  const fill = document.getElementById('depth-fill');
+  if (!fill || !nearEl || !farEl) return;
+  const nv = parseFloat(nearEl.value);
+  const fv = parseFloat(farEl.value);
+  const cv = parseFloat(centerEl.value);
+  const nPct = (nv / SLIDER_MAX) * 100;
+  const fPct = (fv / SLIDER_MAX) * 100;
+  fill.style.left = `${nPct}%`;
+  fill.style.width = `${Math.max(fPct - nPct, 0)}%`;
+  // Center handle stays on top so it remains grabbable; near/far swap by side
+  centerEl.style.zIndex = '3';
+  const mid = (nv + fv) / 2;
+  if (cv < mid) {
+    nearEl.style.zIndex = '2'; farEl.style.zIndex = '1';
+  } else {
+    nearEl.style.zIndex = '1'; farEl.style.zIndex = '2';
+  }
+}
+
+function updateDepthValueLabels() {
+  document.getElementById('depth-near-val').textContent = `near ${depthState.near.toFixed(1)}`;
+  document.getElementById('depth-far-val').textContent = `far ${depthState.far.toFixed(1)}`;
+}
+
+function depthSliderChanged(panels, source) {
+  const nearEl = document.getElementById('depth-near');
+  const centerEl = document.getElementById('depth-center');
+  const farEl = document.getElementById('depth-far');
+  let nv = parseInt(nearEl.value, 10);
+  let cv = parseInt(centerEl.value, 10);
+  let fv = parseInt(farEl.value, 10);
+
+  if (source === 'center') {
+    // Center moves: shift near/far by the delta, clamped to [0, SLIDER_MAX].
+    const prevCenter = (nv + fv) / 2;
+    let delta = cv - prevCenter;
+    const halfL = prevCenter - nv;
+    const halfR = fv - prevCenter;
+    const minDelta = -nv;
+    const maxDelta = SLIDER_MAX - fv;
+    delta = Math.max(minDelta, Math.min(maxDelta, delta));
+    nv = Math.round(prevCenter + delta - halfL);
+    fv = Math.round(prevCenter + delta + halfR);
+    cv = Math.round((nv + fv) / 2);
+  } else if (source === 'near') {
+    // Near moves: mirror around center (far moves the opposite way by the same delta)
+    // Clamp so half-width stays within [MIN_GAP/2, min(cv, SLIDER_MAX - cv)]
+    let half = cv - nv;
+    const maxHalf = Math.min(cv, SLIDER_MAX - cv);
+    half = Math.max(MIN_GAP / 2, Math.min(half, maxHalf));
+    nv = Math.round(cv - half);
+    fv = Math.round(cv + half);
+  } else if (source === 'far') {
+    let half = fv - cv;
+    const maxHalf = Math.min(cv, SLIDER_MAX - cv);
+    half = Math.max(MIN_GAP / 2, Math.min(half, maxHalf));
+    nv = Math.round(cv - half);
+    fv = Math.round(cv + half);
+  }
+  writeSliders(nv, cv, fv);
+  depthState.near = sliderToDist(nv);
+  depthState.far = sliderToDist(fv);
+  updateDepthValueLabels();
+  updateDepthFill();
+  const depthPanel = panels[2];
+  if (depthPanel) depthPanel.renderWindow.render();
+}
+
+// Returns focal-relative z range: 0 = focal point, negative = closer to camera.
+function computeFocalRelativeZRange(panel, actorsData) {
+  if (!actorsData || !actorsData.length) return null;
+  const cam = panel.renderer.getActiveCamera();
+  const pos = cam.getPosition();
+  const fp = cam.getFocalPoint();
+  const dx = fp[0] - pos[0], dy = fp[1] - pos[1], dz = fp[2] - pos[2];
+  const focalDist = Math.sqrt(dx * dx + dy * dy + dz * dz) || 1;
+  const vx = dx / focalDist, vy = dy / focalDist, vz = dz / focalDist;
+  let zmin = Infinity, zmax = -Infinity;
+  for (const ad of actorsData) {
+    const b = ad.polyData.getBounds();
+    for (let i = 0; i < 8; i++) {
+      const x = (i & 1) ? b[1] : b[0];
+      const y = (i & 2) ? b[3] : b[2];
+      const z = (i & 4) ? b[5] : b[4];
+      const dist = (x - pos[0]) * vx + (y - pos[1]) * vy + (z - pos[2]) * vz;
+      if (dist < zmin) zmin = dist;
+      if (dist > zmax) zmax = dist;
+    }
+  }
+  // Translate to focal-relative (focal = 0)
+  return { near: zmin - focalDist, far: zmax - focalDist };
+}
+
+function autoFitDepth(panels) {
+  const depthPanel = panels[2];
+  const range = computeFocalRelativeZRange(depthPanel, currentActorsData);
+  if (!range) return;
+  const pad = (range.far - range.near) * 0.05;
+  const near = range.near - pad;
+  const far = range.far + pad;
+  const delta = far - near;
+  // Slider scale: ±1× the fitted range around it
+  depthSlider.min = near - delta;
+  depthSlider.max = far + delta;
+  depthState.near = near;
+  depthState.far = far;
+  const nv = distToSlider(near);
+  const fv = distToSlider(far);
+  writeSliders(nv, Math.round((nv + fv) / 2), fv);
+  updateDepthValueLabels();
+  updateDepthFill();
+  depthPanel.renderWindow.render();
 }
 
 // ── Main ────────────────────────────────────────────────────────────
@@ -429,6 +612,13 @@ async function main() {
   await buildAndPopulate(scene, panels);
 
   syncCameras(panels);
+  autoFitDepth(panels);
+
+  // Depth slider wiring
+  document.getElementById('depth-near').addEventListener('input', () => depthSliderChanged(panels, 'near'));
+  document.getElementById('depth-center').addEventListener('input', () => depthSliderChanged(panels, 'center'));
+  document.getElementById('depth-far').addEventListener('input', () => depthSliderChanged(panels, 'far'));
+  document.getElementById('depth-fit').addEventListener('click', () => autoFitDepth(panels));
 
   // Background preset thumbnails
   const thumbs = document.getElementById('bg-thumbs');
@@ -478,6 +668,7 @@ async function main() {
       const buf = await file.arrayBuffer();
       const newScene = await parseZprjBuffer(buf);
       await buildAndPopulate(newScene, panels);
+      autoFitDepth(panels);
       document.getElementById('zprj-name').textContent = file.name;
     } catch (err) {
       console.error(err);
