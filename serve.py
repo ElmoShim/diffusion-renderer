@@ -1,7 +1,7 @@
-"""HTTP server for the G-buffer web viewer.
+"""HTTP server for the diffusion renderer web demo.
 
-Builds the Vite app if needed, copies the sample .zprj into the serve
-directory, then serves everything.
+Serves the Vite-built frontend, the inverse-render asset folder, and a
+POST /render endpoint that runs the diffusion forward renderer.
 
 Usage:
     uv run serve.py                          # default: samples/garment.zprj
@@ -9,10 +9,25 @@ Usage:
 """
 
 import argparse
+import cgi
+import datetime
+import io
+import json
 import os
 import shutil
 import subprocess
+import threading
+import traceback
 from http.server import HTTPServer, SimpleHTTPRequestHandler
+
+
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+INVERSE_DIR = os.path.join(PROJECT_ROOT, "asset", "inverse")
+OUTPUT_DIR = os.path.join(PROJECT_ROOT, "output", "web_capture")
+GBUFFER_NAMES = ["basecolor", "normal", "depth", "roughness", "metallic"]
+DEFAULT_HDR = os.path.join(PROJECT_ROOT, "examples", "hdri", "sunny_vondelpark_1k.hdr")
+
+_save_lock = threading.Lock()
 
 
 def build_web_client(web_dir):
@@ -34,12 +49,16 @@ def build_web_client(web_dir):
     dist_mtime = os.path.getmtime(os.path.join(dist_dir, "index.html")) if os.path.exists(os.path.join(dist_dir, "index.html")) else 0
     if max(src_mtime, idx_mtime, pub_mtime) > dist_mtime:
         print("Building web client ...")
-        subprocess.run(["npx", "vite", "build"], cwd=web_dir, check=True)
+        local_vite = os.path.join(web_dir, "node_modules", ".bin", "vite")
+        vite_cmd = [local_vite, "build"] if os.path.isfile(local_vite) else ["npx", "vite", "build"]
+        subprocess.run(vite_cmd, cwd=web_dir, check=True)
     return dist_dir
 
 
 class Handler(SimpleHTTPRequestHandler):
     serve_dir = None
+    hdr_path = DEFAULT_HDR
+    device = "cuda"
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=Handler.serve_dir, **kwargs)
@@ -50,40 +69,130 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("Expires", "0")
         super().end_headers()
 
+    def _send_text(self, code, msg):
+        body = msg.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        # Serve /inverse/* from asset/inverse/
+        if self.path.startswith("/inverse/"):
+            rel = self.path[len("/inverse/"):].split("?")[0]
+            file_path = os.path.normpath(os.path.join(INVERSE_DIR, rel))
+            if not file_path.startswith(INVERSE_DIR):
+                self._send_text(403, "Forbidden")
+                return
+            if not os.path.isfile(file_path):
+                self._send_text(404, "Not found")
+                return
+            try:
+                with open(file_path, "rb") as f:
+                    data = f.read()
+            except OSError as e:
+                self._send_text(500, str(e))
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        return super().do_GET()
+
+    def do_POST(self):
+        if self.path != "/render":
+            self._send_text(404, "Not found")
+            return
+
+        ctype = self.headers.get("Content-Type", "")
+        if not ctype.startswith("multipart/form-data"):
+            self._send_text(400, "Expected multipart/form-data")
+            return
+
+        try:
+            fs = cgi.FieldStorage(
+                fp=self.rfile, headers=self.headers,
+                environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": ctype},
+            )
+
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            save_dir = os.path.join(OUTPUT_DIR, timestamp)
+            os.makedirs(save_dir, exist_ok=True)
+
+            saved = []
+            for name in GBUFFER_NAMES:
+                if name in fs:
+                    item = fs[name]
+                    raw = item.file.read()
+                    path = os.path.join(save_dir, f"{name}.png")
+                    with open(path, "wb") as f:
+                        f.write(raw)
+                    saved.append(name)
+
+            if not saved:
+                self._send_text(400, "No G-buffers provided")
+                return
+
+            with _save_lock:
+                print(f"[/render] saved {len(saved)} G-buffers → {os.path.relpath(save_dir)}: {saved}")
+
+            body = json.dumps({
+                "saved_dir": os.path.relpath(save_dir, PROJECT_ROOT),
+                "files": saved,
+            }).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as e:
+            traceback.print_exc()
+            self._send_text(500, f"Save failed: {e}")
+
 
 def main():
-    parser = argparse.ArgumentParser(description="G-buffer web viewer server")
+    parser = argparse.ArgumentParser(description="Diffusion renderer web demo server")
     parser.add_argument("input", nargs="?", default="samples/garment.zprj",
                         help="Path to .zprj file")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--dev", action="store_true",
                         help="Dev mode: skip build, use 'npm run dev' in web/ for frontend")
+    parser.add_argument("--hdr", default=DEFAULT_HDR,
+                        help="HDR environment map for forward rendering")
+    parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
 
-    web_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
+    web_dir = os.path.join(PROJECT_ROOT, "web")
 
     zprj_path = os.path.abspath(args.input)
     if not os.path.exists(zprj_path):
         print(f"Error: {zprj_path} not found")
         return
 
+    Handler.hdr_path = os.path.abspath(args.hdr)
+    Handler.device = args.device
+
     if args.dev:
         Handler.serve_dir = web_dir
-        # In dev mode, copy zprj to public/ for Vite dev server to serve
         dest = os.path.join(web_dir, "public", "sample.zprj")
         shutil.copy2(zprj_path, dest)
         print(f"Copied {args.input} → web/public/sample.zprj")
-        print(f"Dev mode: run 'npm run dev' in web/ for frontend with HMR")
+        print("Dev mode: run 'npm run dev' in web/ for frontend with HMR")
     else:
         dist_dir = build_web_client(web_dir)
-        # Copy zprj to dist/ after build (not public/ to avoid triggering rebuilds)
         dest = os.path.join(dist_dir, "sample.zprj")
         shutil.copy2(zprj_path, dest)
         print(f"Copied {args.input} → {os.path.relpath(dest)}")
         Handler.serve_dir = dist_dir
 
+    print(f"HDR: {Handler.hdr_path}")
+    print(f"Inverse asset dir: {INVERSE_DIR}")
     server = HTTPServer(("0.0.0.0", args.port), Handler)
     print(f"Server running at http://localhost:{args.port}")
+    print("Note: diffusion model will load lazily on first /render request.")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

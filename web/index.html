@@ -3,25 +3,226 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>G-Buffer Viewer</title>
+<title>Diffusion Renderer Demo</title>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 html, body { width: 100%; height: 100%; background: #1a1a1a; color: #eee; font-family: system-ui, sans-serif; overflow: hidden; }
-#grid { display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; width: 100vw; height: 100vh; gap: 2px; background: #333; }
-.panel { position: relative; background: #000; overflow: hidden; }
-.panel-label { position: absolute; top: 8px; left: 10px; font-size: 13px; font-weight: 600; color: #fff; background: rgba(0,0,0,0.6); padding: 2px 8px; border-radius: 3px; z-index: 10; pointer-events: none; }
-#loading { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; background: #1a1a1a; z-index: 100; font-size: 16px; }
+
+#app { display: flex; flex-direction: column; width: 100vw; height: 100vh; }
+
+/* Toolbar */
+#toolbar {
+  display: flex; align-items: center; gap: 16px;
+  padding: 10px 16px; background: #222; border-bottom: 1px solid #333;
+  flex-shrink: 0;
+}
+#toolbar button, #toolbar label.btn {
+  background: #333; border: 1px solid #555; color: #eee;
+  padding: 6px 14px; border-radius: 4px; cursor: pointer; font: inherit; font-size: 13px;
+}
+#toolbar button:hover, #toolbar label.btn:hover { background: #444; }
+#toolbar button:disabled { opacity: 0.5; cursor: not-allowed; }
+.toolbar-group { display: flex; align-items: center; gap: 8px; }
+.toolbar-label { font-size: 12px; color: #999; margin-right: 4px; }
+
+/* Bg preset thumbnails */
+.bg-thumbs { display: flex; gap: 6px; }
+.bg-thumb {
+  width: 80px; height: 44px;
+  background-size: cover; background-position: center;
+  border: 2px solid #444; border-radius: 4px; cursor: pointer;
+  transition: border-color 120ms;
+}
+.bg-thumb:hover { border-color: #888; }
+.bg-thumb.active { border-color: #c95a2e; }
+.bg-thumb.clear {
+  background: #2a2a2a; display: flex; align-items: center; justify-content: center;
+  font-size: 11px; color: #888;
+}
+
+/* Main grid: 2x2 G-buffer fills the area */
+#main {
+  flex: 1; min-height: 0;
+  display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr;
+  gap: 8px; padding: 12px;
+  background: #1a1a1a;
+}
+
+/* Result modal */
+#result-modal {
+  position: fixed; inset: 0; z-index: 200;
+  background: rgba(0, 0, 0, 0.85);
+  display: none;
+  align-items: center; justify-content: center;
+  padding: 32px;
+}
+#result-modal.visible { display: flex; }
+#result-modal-content {
+  position: relative;
+  background: #111; border-radius: 8px; padding: 16px;
+  max-width: 100%; max-height: 100%;
+  display: flex; flex-direction: column; gap: 12px;
+}
+#result-modal-img {
+  display: block;
+  max-width: calc(100vw - 80px);
+  max-height: calc(100vh - 140px);
+  aspect-ratio: 1280 / 704;
+  width: auto; height: auto;
+  background: #000; border-radius: 4px;
+  object-fit: contain;
+}
+#result-modal-header {
+  display: flex; align-items: center; justify-content: space-between;
+}
+#result-modal-title { font-size: 14px; font-weight: 600; color: #eee; }
+#result-modal-close {
+  background: #333; border: 1px solid #555; color: #eee;
+  padding: 4px 12px; border-radius: 4px; cursor: pointer;
+  font: inherit; font-size: 12px;
+}
+#result-modal-close:hover { background: #444; }
+#result-modal-status {
+  color: #888; font-size: 12px;
+  display: flex; align-items: center; gap: 8px;
+}
+.spinner {
+  width: 14px; height: 14px;
+  border: 2px solid rgba(255,255,255,0.15);
+  border-top-color: #c95a2e;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* Cell wrapper centers the aspect-locked panel inside its grid cell */
+.panel-cell {
+  position: relative;
+  min-width: 0; min-height: 0;
+  display: flex; align-items: center; justify-content: center;
+  overflow: hidden;
+}
+
+/* Panel: maintain 1280:704 aspect, fit inside its cell */
+.panel {
+  position: relative;
+  background: #000;
+  overflow: hidden;
+  border-radius: 4px;
+  aspect-ratio: 1280 / 704;
+  /* Choose the dimension that fits: container query via container-type
+     fallback — use both max-width:100% and max-height:100% and pick
+     the smaller via min() based on parent. We rely on flex centering
+     in .panel-cell + this trick: */
+  max-width: 100%;
+  max-height: 100%;
+  width: 100%;
+  height: auto;
+}
+/* When the cell is wider than 1280:704 of its height, height becomes
+   the limit — switch to height-driven sizing. */
+@supports (aspect-ratio: 1) {
+  .panel-cell { container-type: size; }
+  @container (min-aspect-ratio: 1280/704) {
+    .panel { width: auto; height: 100%; }
+  }
+}
+.panel-canvas-wrap {
+  position: absolute; inset: 0;
+}
+.panel-bg-img {
+  position: absolute; inset: 0;
+  width: 100%; height: 100%;
+  object-fit: cover;
+  pointer-events: none;
+  display: none;
+}
+.panel-bg-img.visible { display: block; }
+.panel-canvas-wrap canvas { position: relative; z-index: 1; }
+.panel-label {
+  position: absolute; top: 6px; left: 8px; z-index: 10;
+  font-size: 11px; font-weight: 600; color: #fff;
+  background: rgba(0,0,0,0.6); padding: 2px 8px; border-radius: 3px;
+  pointer-events: none;
+}
+.panel-placeholder {
+  position: absolute; inset: 0; display: flex;
+  align-items: center; justify-content: center;
+  color: #555; font-size: 13px;
+  pointer-events: none;
+}
+
+#loading {
+  position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+  background: rgba(26, 26, 26, 0.95); z-index: 100; font-size: 14px;
+}
 #loading.hidden { display: none; }
+
+#status-bar {
+  position: fixed; bottom: 0; left: 0; right: 0;
+  background: #222; border-top: 1px solid #333;
+  padding: 4px 12px; font-size: 11px; color: #888;
+  display: none;
+}
+#status-bar.visible { display: block; }
 </style>
 </head>
 <body>
-<div id="loading">Loading scene...</div>
-<div id="grid">
-  <div class="panel" id="panel-basecolor"><span class="panel-label">Basecolor</span></div>
-  <div class="panel" id="panel-normal"><span class="panel-label">Normal</span></div>
-  <div class="panel" id="panel-depth"><span class="panel-label">Depth</span></div>
-  <div class="panel" id="panel-roughness"><span class="panel-label">Roughness</span></div>
+<div id="app">
+  <div id="toolbar">
+    <div class="toolbar-group">
+      <label class="btn" for="zprj-file">Upload .zprj</label>
+      <input type="file" id="zprj-file" accept=".zprj" style="display:none">
+      <span id="zprj-name" class="toolbar-label"></span>
+    </div>
+    <div class="toolbar-group">
+      <span class="toolbar-label">Background:</span>
+      <div class="bg-thumbs" id="bg-thumbs"></div>
+    </div>
+    <div style="flex:1"></div>
+    <div class="toolbar-group">
+      <button id="render-btn">Render</button>
+    </div>
+  </div>
+
+  <div id="main">
+    <div class="panel-cell"><div class="panel" id="panel-basecolor">
+      <img class="panel-bg-img" data-buf="basecolor">
+      <div class="panel-canvas-wrap"></div>
+      <span class="panel-label">Basecolor</span>
+    </div></div>
+    <div class="panel-cell"><div class="panel" id="panel-normal">
+      <img class="panel-bg-img" data-buf="normal">
+      <div class="panel-canvas-wrap"></div>
+      <span class="panel-label">Normal</span>
+    </div></div>
+    <div class="panel-cell"><div class="panel" id="panel-depth">
+      <img class="panel-bg-img" data-buf="depth">
+      <div class="panel-canvas-wrap"></div>
+      <span class="panel-label">Depth</span>
+    </div></div>
+    <div class="panel-cell"><div class="panel" id="panel-roughness">
+      <img class="panel-bg-img" data-buf="roughness">
+      <div class="panel-canvas-wrap"></div>
+      <span class="panel-label">Roughness</span>
+    </div></div>
+  </div>
 </div>
+
+<div id="result-modal">
+  <div id="result-modal-content">
+    <div id="result-modal-header">
+      <span id="result-modal-title">Rendered Result</span>
+      <button id="result-modal-close">Close</button>
+    </div>
+    <img id="result-modal-img" alt="Rendered result">
+    <div id="result-modal-status"></div>
+  </div>
+</div>
+
+<div id="loading">Loading scene...</div>
+<div id="status-bar"></div>
+
 <script type="module" src="/src/main.js"></script>
 </body>
 </html>
