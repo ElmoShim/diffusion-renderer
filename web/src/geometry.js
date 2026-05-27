@@ -222,6 +222,82 @@ export async function loadOpacityComposite(scene, colorPath, mat) {
   return texture;
 }
 
+// Normal-map texture for the normal G-buffer pass: RGB = tangent-space normal
+// map (raw/linear bytes, so the shader can decode rgb*2-1), A = opacity map (or
+// 255 when the fabric has no opacity). Packing both into one RGBA texture keeps
+// the normal pass to a single sampler (texture1). vtk.js has no built-in normal
+// mapping, so the shader perturbs the normal manually with a TBN built from the
+// per-vertex tangents attached by attachTangents(). Returns null if no map.
+async function loadNormalComposite(scene, mat, hasOpacity, texCache) {
+  const nPath = mat?.normalTexturePath || null;
+  if (!nPath) return null;
+  const opPart = hasOpacity ? (mat.opacityTexturePath || '') : '';
+  const key = `normal:${nPath}:${opPart}`;
+  if (!texCache.has(key)) {
+    // loadOpacityComposite puts colorPath in RGB and the material's opacity in A;
+    // passing mat=null leaves A=255 (opaque normal map, no cutout).
+    texCache.set(key, await loadOpacityComposite(scene, nPath, hasOpacity ? mat : null));
+  }
+  return texCache.get(key) || null;
+}
+
+// Compute per-vertex tangents (Lengyel's method) from the polydata's positions,
+// triangle indices, the *transformed* TCoords (so they match how the normal map
+// is sampled), and normals, then attach them as a 4-component point-data array
+// named "tangent" (xyz = tangent, w = bitangent handedness). The normal pass
+// binds it via mapper.setCustomShaderAttributes(['tangent']) → GLSL `tangentMC`.
+// Returns false (and attaches nothing) when the mesh lacks usable UVs/normals.
+function attachTangents(polyData) {
+  const pd = polyData.getPointData();
+  const tcA = pd.getTCoords();
+  const nA = pd.getNormals();
+  if (!tcA || !nA) return false;
+  const pts = polyData.getPoints().getData();
+  const tc = tcA.getData();
+  const nrm = nA.getData();
+  const polys = polyData.getPolys().getData();
+  const vc = pts.length / 3;
+  if (tc.length < vc * 2 || nrm.length < vc * 3) return false;
+
+  const tan1 = new Float32Array(vc * 3);
+  const tan2 = new Float32Array(vc * 3);
+  for (let c = 0; c + 3 < polys.length; c += 4) {
+    if (polys[c] !== 3) return false; // expects pure triangles
+    const i0 = polys[c + 1], i1 = polys[c + 2], i2 = polys[c + 3];
+    const p0 = i0 * 3, p1 = i1 * 3, p2 = i2 * 3;
+    const u0 = i0 * 2, u1 = i1 * 2, u2 = i2 * 2;
+    const x1 = pts[p1] - pts[p0], y1 = pts[p1 + 1] - pts[p0 + 1], z1 = pts[p1 + 2] - pts[p0 + 2];
+    const x2 = pts[p2] - pts[p0], y2 = pts[p2 + 1] - pts[p0 + 1], z2 = pts[p2 + 2] - pts[p0 + 2];
+    const s1 = tc[u1] - tc[u0], t1 = tc[u1 + 1] - tc[u0 + 1];
+    const s2 = tc[u2] - tc[u0], t2 = tc[u2 + 1] - tc[u0 + 1];
+    const denom = s1 * t2 - s2 * t1;
+    const r = denom !== 0 ? 1.0 / denom : 0.0;
+    const sx = (t2 * x1 - t1 * x2) * r, sy = (t2 * y1 - t1 * y2) * r, sz = (t2 * z1 - t1 * z2) * r;
+    const tx = (s1 * x2 - s2 * x1) * r, ty = (s1 * y2 - s2 * y1) * r, tz = (s1 * z2 - s2 * z1) * r;
+    for (const idx of [i0, i1, i2]) {
+      tan1[idx * 3] += sx; tan1[idx * 3 + 1] += sy; tan1[idx * 3 + 2] += sz;
+      tan2[idx * 3] += tx; tan2[idx * 3 + 1] += ty; tan2[idx * 3 + 2] += tz;
+    }
+  }
+
+  const out = new Float32Array(vc * 4);
+  for (let v = 0; v < vc; v++) {
+    const nx = nrm[v * 3], ny = nrm[v * 3 + 1], nz = nrm[v * 3 + 2];
+    let tx = tan1[v * 3], ty = tan1[v * 3 + 1], tz = tan1[v * 3 + 2];
+    // Gram-Schmidt orthogonalize the tangent against the normal.
+    const nd = nx * tx + ny * ty + nz * tz;
+    tx -= nx * nd; ty -= ny * nd; tz -= nz * nd;
+    const len = Math.hypot(tx, ty, tz);
+    if (len > 1e-8) { tx /= len; ty /= len; tz /= len; } else { tx = 1; ty = 0; tz = 0; }
+    // Handedness: sign of dot(cross(n, t), accumulated bitangent).
+    const cx = ny * tz - nz * ty, cy = nz * tx - nx * tz, cz = nx * ty - ny * tx;
+    const h = (cx * tan2[v * 3] + cy * tan2[v * 3 + 1] + cz * tan2[v * 3 + 2]) < 0 ? -1 : 1;
+    out[v * 4] = tx; out[v * 4 + 1] = ty; out[v * 4 + 2] = tz; out[v * 4 + 3] = h;
+  }
+  pd.addArray(vtkDataArray.newInstance({ numberOfComponents: 4, values: out, name: 'tangent' }));
+  return true;
+}
+
 // Material resolution (matching Python utils_render_vtk.py logic)
 
 function getPatternMaterial(scene, patternIndex) {
@@ -275,25 +351,26 @@ export async function buildSceneActors(scene) {
     let diffuseTex = null;
     let roughnessTex = null;
     let opacityTex = null;
-    const hasOpacity = !!(mat && mat.opacityTexturePath);
+    let normalTex = null;
+    let hasNormalMap = false;
+    let hasOpacity = !!(mat && mat.opacityTexturePath && mat.opaqueMode !== 4);
 
     if (mat && pattern.uvVertexCount === pattern.vertexCount) {
       const diffusePath = mat.diffuseTexturePath || null;
       const roughPath = mat.roughnessTexturePath || null;
+      const opPath = mat.opacityTexturePath || null;
 
       if (hasOpacity) {
-        // Merge the opacity map into the alpha of each color texture so VTK.js
-        // renders knit gaps translucently (opacity *= texture1.a). The white-RGB
-        // composite is reused by the normal/depth shaders via `opacity`.
-        const dKey = `diff+op:${diffusePath}`;
+        const dKey = `diff+op:${diffusePath}:${opPath}`;
         if (!texCache.has(dKey)) texCache.set(dKey, await loadOpacityComposite(scene, diffusePath, mat));
         diffuseTex = texCache.get(dKey);
-        const rKey = `rough+op:${roughPath}`;
+        const rKey = `rough+op:${roughPath}:${opPath}`;
         if (!texCache.has(rKey)) texCache.set(rKey, await loadOpacityComposite(scene, roughPath, mat));
         roughnessTex = texCache.get(rKey);
-        const oKey = 'op:white';
+        const oKey = `op:white:${opPath}`;
         if (!texCache.has(oKey)) texCache.set(oKey, await loadOpacityComposite(scene, null, mat));
         opacityTex = texCache.get(oKey);
+        if (!opacityTex) hasOpacity = false;
       } else {
         if (diffusePath) {
           if (!texCache.has(diffusePath)) texCache.set(diffusePath, await loadTextureFromScene(scene, diffusePath));
@@ -305,12 +382,14 @@ export async function buildSceneActors(scene) {
           roughnessTex = texCache.get(rKey);
         }
       }
+      normalTex = await loadNormalComposite(scene, mat, hasOpacity, texCache);
 
-      if (diffuseTex || roughnessTex || opacityTex) {
+      if (diffuseTex || roughnessTex || opacityTex || normalTex) {
         const uvs = pattern.getUVs();
         const { tw, th } = textureTileMm(mat);
         setTexCoords(polyData, uvs, pattern.vertexCount, tw, th, mat.diffuseTextureTransform);
       }
+      if (normalTex) hasNormalMap = attachTangents(polyData);
     }
 
     const baseColor = mat ? normalizeColor(mat.getBaseColor()) : [0.8, 0.8, 0.8];
@@ -319,7 +398,8 @@ export async function buildSceneActors(scene) {
     const metallic = isPBR ? (mat.metalness ?? 0.0) : 0.0;
     actors.push({
       polyData, diffuseColor: baseColor, roughness, metallic,
-      diffuseTex, roughnessTex, opacityTex, hasOpacity, type: 'garment',
+      diffuseTex, roughnessTex, opacityTex, hasOpacity,
+      normalTex, hasNormalMap, type: 'garment',
     });
   }
 
@@ -354,22 +434,41 @@ export async function buildSceneActors(scene) {
 
     let diffuseTex = null;
     let roughnessTex = null;
+    let opacityTex = null;
+    let normalTex = null;
+    let hasNormalMap = false;
     const hasUV = mat && mesh.uvVertexCount === mesh.vertexCount;
+    let hasOpacity = !!(hasUV && mat && mat.opacityTexturePath && mat.opaqueMode !== 4);
 
     if (hasUV) {
-      if (mat.diffuseTexturePath) {
-        const tp = mat.diffuseTexturePath;
-        if (!texCache.has(tp)) texCache.set(tp, await loadTextureFromScene(scene, tp));
-        diffuseTex = texCache.get(tp);
-      }
-      if (mat.roughnessTexturePath) {
-        const rp = 'rough:' + mat.roughnessTexturePath;
-        if (!texCache.has(rp)) {
-          texCache.set(rp, await loadTextureFromScene(scene, mat.roughnessTexturePath));
+      const diffusePath = mat.diffuseTexturePath || null;
+      const roughPath = mat.roughnessTexturePath || null;
+      const opPath = mat.opacityTexturePath || null;
+
+      if (hasOpacity) {
+        const dKey = `diff+op:${diffusePath}:${opPath}`;
+        if (!texCache.has(dKey)) texCache.set(dKey, await loadOpacityComposite(scene, diffusePath, mat));
+        diffuseTex = texCache.get(dKey);
+        const rKey = `rough+op:${roughPath}:${opPath}`;
+        if (!texCache.has(rKey)) texCache.set(rKey, await loadOpacityComposite(scene, roughPath, mat));
+        roughnessTex = texCache.get(rKey);
+        const oKey = `op:white:${opPath}`;
+        if (!texCache.has(oKey)) texCache.set(oKey, await loadOpacityComposite(scene, null, mat));
+        opacityTex = texCache.get(oKey);
+        if (!opacityTex) hasOpacity = false;
+      } else {
+        if (diffusePath) {
+          if (!texCache.has(diffusePath)) texCache.set(diffusePath, await loadTextureFromScene(scene, diffusePath));
+          diffuseTex = texCache.get(diffusePath);
         }
-        roughnessTex = texCache.get(rp);
+        if (roughPath) {
+          const rp = 'rough:' + roughPath;
+          if (!texCache.has(rp)) texCache.set(rp, await loadTextureFromScene(scene, roughPath));
+          roughnessTex = texCache.get(rp);
+        }
       }
-      if (diffuseTex || roughnessTex) {
+      normalTex = await loadNormalComposite(scene, mat, hasOpacity, texCache);
+      if (diffuseTex || roughnessTex || opacityTex || normalTex) {
         const freshMesh = scene.get_avatarMeshes(i);
         const uvs = freshMesh.getUVs();
         const uvCopy = new Float32Array(uvs.length);
@@ -379,11 +478,13 @@ export async function buildSceneActors(scene) {
         });
         polyData.getPointData().setTCoords(tcoords);
       }
+      if (normalTex) hasNormalMap = attachTangents(polyData);
     }
 
     actors.push({
       polyData, diffuseColor, roughness: 0.5, metallic: 0.0,
-      diffuseTex, roughnessTex, type: 'avatar',
+      diffuseTex, roughnessTex, opacityTex, hasOpacity,
+      normalTex, hasNormalMap, type: 'avatar',
     });
   }
 
@@ -403,9 +504,78 @@ export async function buildSceneActors(scene) {
       if (!isIdentity(tm)) applyMatrix(polyData, tm);
     } catch { /* no transform */ }
 
+    let mat = null;
+    try { if (trim.hasColorwayMaterial) mat = trim.getColorwayMaterial(); } catch { /* skip */ }
+
+    let diffuseColor = [0.6, 0.6, 0.7];
+    let roughness = 0.5;
+    let metallic = 0.0;
+    if (mat) {
+      try {
+        const dc = mat.getDiffuseColor();
+        if (dc && dc.length >= 3) diffuseColor = normalizeColor(dc);
+      } catch { /* fallback */ }
+      try {
+        if (mat.useMetalnessRoughnessPBR) {
+          roughness = mat.roughness ?? 0.5;
+          metallic = mat.metalness ?? 0.0;
+        }
+      } catch { /* fallback */ }
+    }
+
+    let diffuseTex = null;
+    let roughnessTex = null;
+    let opacityTex = null;
+    let normalTex = null;
+    let hasNormalMap = false;
+    const hasUV = mat && trim.meshUVVertexCount === trim.meshVertexCount;
+    let hasOpacity = !!(hasUV && mat && mat.opacityTexturePath && mat.opaqueMode !== 4);
+
+    if (hasUV) {
+      const diffusePath = mat.diffuseTexturePath || null;
+      const roughPath = mat.roughnessTexturePath || null;
+      const opPath = mat.opacityTexturePath || null;
+
+      if (hasOpacity) {
+        const dKey = `diff+op:${diffusePath}:${opPath}`;
+        if (!texCache.has(dKey)) texCache.set(dKey, await loadOpacityComposite(scene, diffusePath, mat));
+        diffuseTex = texCache.get(dKey);
+        const rKey = `rough+op:${roughPath}:${opPath}`;
+        if (!texCache.has(rKey)) texCache.set(rKey, await loadOpacityComposite(scene, roughPath, mat));
+        roughnessTex = texCache.get(rKey);
+        const oKey = `op:white:${opPath}`;
+        if (!texCache.has(oKey)) texCache.set(oKey, await loadOpacityComposite(scene, null, mat));
+        opacityTex = texCache.get(oKey);
+        if (!opacityTex) hasOpacity = false;
+      } else {
+        if (diffusePath) {
+          if (!texCache.has(diffusePath)) texCache.set(diffusePath, await loadTextureFromScene(scene, diffusePath));
+          diffuseTex = texCache.get(diffusePath);
+        }
+        if (roughPath) {
+          const rp = 'rough:' + roughPath;
+          if (!texCache.has(rp)) texCache.set(rp, await loadTextureFromScene(scene, roughPath));
+          roughnessTex = texCache.get(rp);
+        }
+      }
+      normalTex = await loadNormalComposite(scene, mat, hasOpacity, texCache);
+      if (diffuseTex || roughnessTex || opacityTex || normalTex) {
+        const freshTrim = scene.get_trimObjects(i);
+        const uvs = freshTrim.getMeshUVs();
+        const uvCopy = new Float32Array(uvs.length);
+        for (let j = 0; j < uvs.length; j++) uvCopy[j] = uvs[j];
+        const tcoords = vtkDataArray.newInstance({
+          numberOfComponents: 2, values: uvCopy, name: 'TCoords',
+        });
+        polyData.getPointData().setTCoords(tcoords);
+      }
+      if (normalTex) hasNormalMap = attachTangents(polyData);
+    }
+
     actors.push({
-      polyData, diffuseColor: [0.6, 0.6, 0.7], roughness: 0.5, metallic: 0.0,
-      diffuseTex: null, roughnessTex: null, type: 'trim',
+      polyData, diffuseColor, roughness, metallic,
+      diffuseTex, roughnessTex, opacityTex, hasOpacity,
+      normalTex, hasNormalMap, type: 'trim',
     });
   }
 

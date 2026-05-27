@@ -164,9 +164,11 @@ const NORMAL_SHADER = [
   },
 ];
 
-// Opacity variant: alpha from the opacity map bound as texture1 (white RGB +
-// opacity alpha). VTK.js's automatic opacity *= texture1.a doesn't apply, so we
-// sample the alpha explicitly. Used with forceTranslucent + depth peeling.
+// Matches the Python normal pass (utils_render_vtk.py populate_gbuffer_renderer):
+// emit the view-space normal as color with the opacity map driving the fragment
+// alpha, rendered translucent with depth peeling. Same flip (NORMAL_BODY: n.z < 0)
+// and same peel settings (8 peels, occlusionRatio 0). Used when the material has
+// an opacity map but NO normal map (otherwise NORMAL_MAP_OPACITY_SHADER applies).
 const NORMAL_OPACITY_SHADER = [
   {
     shaderType: 'Fragment',
@@ -175,6 +177,69 @@ const NORMAL_OPACITY_SHADER = [
     replaceFirst: true,
   },
 ];
+
+// ── Normal-map (tangent-space) variants ─────────────────────────────
+// vtk.js has no built-in normal mapping (no PBR interpolation / SetNormalTexture),
+// so we perturb the view-space normal in the shader with a TBN built from the
+// per-vertex tangents geometry.js attaches (point-data array "tangent", bound as
+// the custom vertex attribute `tangentMC` via mapper.setCustomShaderAttributes).
+// This matches Python's SetNormalTexture path, which is what gives hair / fabric
+// their surface detail in the normal G-buffer. The normal map (RGB) and optional
+// opacity (A) are packed into one texture (texture1) by loadNormalComposite.
+//
+// All replacements use replaceFirst:true so they apply in vtk.js's PRE pass while
+// the //VTK::Normal::* hooks are still present; each re-includes its hook so
+// vtk.js's own normalVCVSOutput / normalMatrix / normalMC injection still runs.
+const NORMAL_MAP_VS = [
+  {
+    shaderType: 'Vertex',
+    originalValue: '//VTK::Normal::Dec',
+    replacementValue: '//VTK::Normal::Dec\n      attribute vec4 tangentMC;\n      varying vec3 tangentVCVSOutput;\n      varying float tangentWVSOutput;',
+    replaceFirst: true,
+  },
+  {
+    shaderType: 'Vertex',
+    originalValue: '//VTK::Normal::Impl',
+    replacementValue: '//VTK::Normal::Impl\n      tangentVCVSOutput = normalMatrix * tangentMC.xyz;\n      tangentWVSOutput = tangentMC.w;',
+    replaceFirst: true,
+  },
+];
+
+const NORMAL_MAP_FS_DEC = {
+  shaderType: 'Fragment',
+  originalValue: '//VTK::Normal::Dec',
+  replacementValue: '//VTK::Normal::Dec\n      varying vec3 tangentVCVSOutput;\n      varying float tangentWVSOutput;',
+  replaceFirst: true,
+};
+
+// alphaExpr: GLSL for the output alpha ('1.0' opaque, or 'nmap.a' opacity cutout).
+// Nv (vtk.js's normalized, front-face-flipped view normal) + the per-vertex tangent
+// form the TBN; the tangent-space normal map is decoded (rgb*2-1) and rotated into
+// view space, then flipped toward the camera (n.z < 0) like the geometric pass.
+function normalMapShader(alphaExpr) {
+  return [
+    ...NORMAL_MAP_VS,
+    NORMAL_MAP_FS_DEC,
+    {
+      shaderType: 'Fragment',
+      originalValue: '//VTK::Light::Impl',
+      replacementValue: [
+        'vec4 nmap = texture2D(texture1, tcoordVCVSOutput);',
+        'vec3 Nv = normalize(normalVCVSOutput);',
+        'vec3 Tv = normalize(tangentVCVSOutput - dot(tangentVCVSOutput, Nv) * Nv);',
+        'vec3 Bv = cross(Nv, Tv) * tangentWVSOutput;',
+        'vec3 nt = nmap.xyz * 2.0 - 1.0;',
+        'vec3 nn = normalize(mat3(Tv, Bv, Nv) * nt);',
+        'if (nn.z < 0.0) nn = -nn;',
+        `gl_FragData[0] = vec4(nn * 0.5 + 0.5, ${alphaExpr});`,
+      ].join('\n      '),
+      replaceFirst: true,
+    },
+  ];
+}
+
+const NORMAL_MAP_SHADER = normalMapShader('1.0');
+const NORMAL_MAP_OPACITY_SHADER = normalMapShader('nmap.a');
 
 // For color G-buffers (basecolor/roughness): keep VTK.js's color/lighting, then
 // override the fragment alpha with the opacity map (texture1.a).
@@ -220,8 +285,10 @@ const DEPTH_SHADER = [
   },
 ];
 
-// Depth variant that discards opacity-map holes (texture1.a) so the depth
-// behind the fabric shows through.
+// Depth is a hard opacity cutout, not a blend: a depth value can't be averaged
+// (blending front and behind would invent a distance that is neither), so an
+// opacity-map hole is discarded and the depth of whatever is behind the fabric
+// (body, floor, far background) shows through. Matches the Python depth pass.
 const DEPTH_OPACITY_SHADER = [
   DEPTH_SHADER[0],
   {
@@ -302,15 +369,25 @@ function populateNormal(renderer, actorsData, floorPD) {
   for (const ad of actorsData) {
     const mapper = vtkMapper.newInstance();
     mapper.setInputData(ad.polyData);
-    const useOpacity = ad.hasOpacity && ad.opacityTex;
-    setShaderReplacements(mapper, useOpacity ? NORMAL_OPACITY_SHADER : NORMAL_SHADER);
     const actor = vtkActor.newInstance();
     actor.setMapper(mapper);
-    if (useOpacity) {
-      // Bind the opacity map (white RGB + alpha) as texture1; the shader reads
-      // texture1.a for the fragment alpha and blends knit gaps over the bg.
+
+    if (ad.hasNormalMap && ad.normalTex) {
+      // Perturb the normal with the material's normal map (TBN from per-vertex
+      // tangents), matching Python. normalTex packs the normal map in RGB and the
+      // opacity map in A; when there's opacity we read nmap.a and render translucent.
+      mapper.setCustomShaderAttributes(['tangent']);
+      setShaderReplacements(mapper, ad.hasOpacity ? NORMAL_MAP_OPACITY_SHADER : NORMAL_MAP_SHADER);
+      actor.addTexture(ad.normalTex);
+      if (ad.hasOpacity) actor.setForceTranslucent(true);
+    } else if (ad.hasOpacity && ad.opacityTex) {
+      // Match Python: opacity drives the fragment alpha, rendered translucent with
+      // depth peeling (8 peels) so the web previews the Python normal G-buffer.
+      setShaderReplacements(mapper, NORMAL_OPACITY_SHADER);
       actor.addTexture(ad.opacityTex);
       actor.setForceTranslucent(true);
+    } else {
+      setShaderReplacements(mapper, NORMAL_SHADER);
     }
     renderer.addActor(actor);
   }
@@ -326,7 +403,8 @@ function populateDepth(renderer, actorsData, floorPD) {
     addDepthUniformCallback(mapper);
     const actor = vtkActor.newInstance();
     actor.setMapper(mapper);
-    // Bind the opacity map so the shader discards knit gaps (reveals depth behind).
+    // Bind the opacity map; the shader discards holes (rendered opaque) so the
+    // depth of whatever is behind the fabric shows through — no translucency.
     if (useOpacity) actor.addTexture(ad.opacityTex);
     renderer.addActor(actor);
   }
