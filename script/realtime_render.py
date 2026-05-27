@@ -229,6 +229,8 @@ def main():
         ren = _build_renderer(gbuf_type, actors_data, scene, tex_cache)
         ren.SetViewport(*viewport)
         _add_label(ren, label_text)
+        if gbuf_type == "basecolor":
+            ren.UseFXAAOn()
         win.AddRenderer(ren)
         renderers.append(ren)
 

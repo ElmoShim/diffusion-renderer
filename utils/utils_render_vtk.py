@@ -178,6 +178,7 @@ def _load_vtk_texture(scene, texture_path):
     tex.SetInputData(vtk_img)
     tex.SetRepeat(True)
     tex.SetInterpolate(True)
+    tex.MipmapOn()
     return tex
 
 
@@ -203,6 +204,7 @@ def _load_vtk_texture_grayscale(scene, texture_path):
     tex.SetInputData(vtk_img)
     tex.SetRepeat(True)
     tex.SetInterpolate(True)
+    tex.MipmapOn()
     return tex
 
 

@@ -108,9 +108,12 @@ def _get_forward_render():
 
 def build_web_client(web_dir):
     dist_dir = os.path.join(web_dir, "dist")
+    # On Windows the node tool wrappers carry a .cmd extension; the bare name is
+    # a Unix shell script that CreateProcess can't launch (WinError 193).
+    npm = "npm.cmd" if os.name == "nt" else "npm"
     if not os.path.isdir(os.path.join(web_dir, "node_modules")):
         print("Installing web dependencies ...")
-        subprocess.run(["npm", "install"], cwd=web_dir, check=True)
+        subprocess.run([npm, "install"], cwd=web_dir, check=True)
     src_mtime = max(
         os.path.getmtime(os.path.join(dp, f))
         for dp, _, fns in os.walk(os.path.join(web_dir, "src"))
@@ -125,8 +128,13 @@ def build_web_client(web_dir):
     dist_mtime = os.path.getmtime(os.path.join(dist_dir, "index.html")) if os.path.exists(os.path.join(dist_dir, "index.html")) else 0
     if max(src_mtime, idx_mtime, pub_mtime) > dist_mtime:
         print("Building web client ...")
-        local_vite = os.path.join(web_dir, "node_modules", ".bin", "vite")
-        vite_cmd = [local_vite, "build"] if os.path.isfile(local_vite) else ["npx", "vite", "build"]
+        vite_name = "vite.cmd" if os.name == "nt" else "vite"
+        local_vite = os.path.join(web_dir, "node_modules", ".bin", vite_name)
+        if os.path.isfile(local_vite):
+            vite_cmd = [local_vite, "build"]
+        else:
+            npx = "npx.cmd" if os.name == "nt" else "npx"
+            vite_cmd = [npx, "vite", "build"]
         subprocess.run(vite_cmd, cwd=web_dir, check=True)
     return dist_dir
 

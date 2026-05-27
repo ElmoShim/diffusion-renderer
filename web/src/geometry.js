@@ -267,10 +267,13 @@ export async function loadTextureFromScene(scene, texturePath) {
       el.src = url;
     });
 
-    const texture = vtkTexture.newInstance();
+    // resizable:true forces the mutable texImage2D path instead of
+    // texStorage2D(levels=1); only then does generateMipmap actually run
+    // (WebGL2 makes texStorage textures immutable at 1 mip level → no mipmaps).
+    const texture = vtkTexture.newInstance({ resizable: true });
     texture.setImage(img);
     texture.setRepeat(true);
-    texture.setInterpolate(true);
+    texture.setInterpolate(true); // interpolate=true triggers mipmap generation
     return texture;
   } catch {
     return null;
