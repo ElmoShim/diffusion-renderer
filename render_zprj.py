@@ -51,7 +51,8 @@ def _load_model(cfg, device="cuda"):
 # ── forward rendering ────────────────────────────────────────────────
 
 def forward_render(gbuffers_list, hdr_path, device="cuda", rotate_light=False,
-                    seed=None, num_samples=1, on_sample=None, drop_conds=None):
+                    seed=None, num_samples=1, on_sample=None, drop_conds=None,
+                    on_step=None):
     """Run diffusion forward rendering.
 
     Args:
@@ -141,8 +142,13 @@ def forward_render(gbuffers_list, hdr_path, device="cuda", rotate_light=False,
         for k, v in sample_cond.items():
             batch[k] = v.to(dtype=torch.bfloat16)
 
+        def _on_step(step, total):
+            if on_step is not None:
+                on_step(i, num_samples, step, total)
+
         video = model.generate(batch, guidance=cfg.get("guidance", 0.0),
-                               num_steps=cfg.inference_n_steps, seed=current_seed)
+                               num_steps=cfg.inference_n_steps, seed=current_seed,
+                               on_step=_on_step)
 
         # video: (1, 3, T, H, W) in [-1, 1] → list of PIL Images
         video_uint8 = ((1 + video[0]).clamp(0, 2) / 2 * 255).to(torch.uint8)

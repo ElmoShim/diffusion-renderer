@@ -14,11 +14,12 @@ import datetime
 import io
 import json
 import os
+import queue
 import shutil
 import subprocess
 import threading
 import traceback
-from http.server import HTTPServer, SimpleHTTPRequestHandler
+from http.server import HTTPServer, SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 import numpy as np
 import torch
@@ -36,6 +37,24 @@ DEFAULT_HDR = os.path.join(PROJECT_ROOT, "examples", "hdri", "sunny_vondelpark_1
 _save_lock = threading.Lock()
 _render_lock = threading.Lock()
 _forward_render = None
+
+# SSE progress broadcast: list of active subscriber queues
+_progress_subscribers: list[queue.Queue] = []
+_progress_lock = threading.Lock()
+
+
+def _broadcast_progress(event: dict):
+    """Send a progress event to all active SSE subscribers."""
+    data = "data: " + json.dumps(event) + "\n\n"
+    with _progress_lock:
+        dead = []
+        for q in _progress_subscribers:
+            try:
+                q.put_nowait(data)
+            except queue.Full:
+                dead.append(q)
+        for q in dead:
+            _progress_subscribers.remove(q)
 
 
 def _resolve_hdr_path(name):
@@ -125,6 +144,25 @@ class Handler(SimpleHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
+        # SSE progress stream
+        if self.path == "/progress":
+            return self._handle_progress_sse()
+
+        # List background presets (subdirs of asset/inverse that have rgb_input.png)
+        if self.path == "/bg_presets":
+            presets = []
+            if os.path.isdir(INVERSE_DIR):
+                for name in sorted(os.listdir(INVERSE_DIR)):
+                    if os.path.isfile(os.path.join(INVERSE_DIR, name, "rgb_input.png")):
+                        presets.append(name)
+            body = json.dumps(presets).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
         # Serve /inverse/* from asset/inverse/
         if self.path.startswith("/inverse/"):
             rel = self.path[len("/inverse/"):].split("?")[0]
@@ -145,6 +183,35 @@ class Handler(SimpleHTTPRequestHandler):
             return
 
         return super().do_GET()
+
+    def _handle_progress_sse(self):
+        """Long-lived SSE endpoint for render progress events."""
+        q = queue.Queue(maxsize=128)
+        with _progress_lock:
+            _progress_subscribers.append(q)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        try:
+            while True:
+                try:
+                    chunk = q.get(timeout=25)
+                    self.wfile.write(chunk.encode("utf-8"))
+                    self.wfile.flush()
+                except queue.Empty:
+                    # Heartbeat to keep connection alive
+                    self.wfile.write(b": keep-alive\n\n")
+                    self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            with _progress_lock:
+                try:
+                    _progress_subscribers.remove(q)
+                except ValueError:
+                    pass
 
     def do_POST(self):
         if self.path == "/render":
@@ -219,6 +286,7 @@ class Handler(SimpleHTTPRequestHandler):
 
             print(f"[/render] inputs saved → {os.path.relpath(save_dir)} ({w}x{h}) mode={mode} hdr={hdr_name!r} drop={drop_conds}")
             print("[/render] running diffusion forward render...")
+            _broadcast_progress({"phase": "start", "step": 0, "total": 0})
 
             # Run forward render (serialize — GPU is shared)
             forward_render = _get_forward_render()
@@ -226,14 +294,25 @@ class Handler(SimpleHTTPRequestHandler):
             def on_sample(_i, _seed, frames):
                 frames_holder["frames"] = frames
 
+            def on_step(sample_idx, num_samples, step, total):
+                _broadcast_progress({
+                    "phase": "denoising",
+                    "sample": sample_idx + 1,
+                    "num_samples": num_samples,
+                    "step": step,
+                    "total": total,
+                })
+
             with _render_lock:
                 forward_render(
                     gbuffers, hdr_path, device=Handler.device,
                     rotate_light=(mode == "rotate_light"),
                     num_samples=1,
                     on_sample=on_sample,
+                    on_step=on_step,
                     drop_conds=drop_conds or None,
                 )
+            _broadcast_progress({"phase": "done"})
 
             frames = frames_holder["frames"]
             if not frames:
@@ -341,7 +420,7 @@ def main():
 
     print(f"HDR: {Handler.hdr_path}")
     print(f"Inverse asset dir: {INVERSE_DIR}")
-    server = HTTPServer(("0.0.0.0", args.port), Handler)
+    server = ThreadingHTTPServer(("0.0.0.0", args.port), Handler)
     print(f"Server running at http://localhost:{args.port}")
     print("Note: diffusion model will load lazily on first /render request.")
     try:

@@ -212,6 +212,7 @@ class CosmosRendererBase(torch.nn.Module):
         guidance: float = 0.0,
         num_steps: int = 15,
         seed: int = 1000,
+        on_step=None,
     ) -> Tensor:
         latent_condition = self.prepare_latent_conditions(data_batch)
         condition = self.build_condition(data_batch, latent_condition)
@@ -228,7 +229,7 @@ class CosmosRendererBase(torch.nn.Module):
         xt = torch.randn(state_shape, generator=torch.Generator("cpu").manual_seed(seed)).to(**self.tensor_kwargs) * self.scheduler.init_noise_sigma
 
         from tqdm import tqdm
-        for t in tqdm(self.scheduler.timesteps, desc="Denoising", leave=False):
+        for step_idx, t in enumerate(tqdm(self.scheduler.timesteps, desc="Denoising", leave=False)):
             xt = xt.to(**self.tensor_kwargs)
             xt_scaled = self.scheduler.scale_model_input(xt, timestep=t)
             t_dev = t.to(**self.tensor_kwargs)
@@ -238,6 +239,8 @@ class CosmosRendererBase(torch.nn.Module):
                 output_uncond = self.net(x=xt_scaled, timesteps=t_dev, **uncond.to_dict())
                 output = output + guidance * (output - output_uncond)
             xt = self.scheduler.step(output, t, xt).prev_sample
+            if on_step is not None:
+                on_step(step_idx + 1, num_steps)
 
         video = self.decode(xt)
         return video

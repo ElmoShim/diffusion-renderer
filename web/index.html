@@ -183,11 +183,26 @@ html, body { width: 100%; height: 100%; background: #1a1a1a; color: #eee; font-f
 .gallery-item.pending {
   display: flex; align-items: center; justify-content: center;
 }
-.gallery-item.pending::after {
-  content: ''; width: 16px; height: 16px;
-  border: 2px solid rgba(255,255,255,0.15);
-  border-top-color: #c95a2e; border-radius: 50%;
-  animation: spin 0.8s linear infinite;
+.slider-row {
+  display: flex; flex-direction: column; gap: 4px;
+}
+.slider-label {
+  font-size: 11px; color: #aaa;
+}
+.slider-row input[type=range] {
+  width: 100%; accent-color: #c95a2e;
+  height: 4px; cursor: pointer;
+}
+
+.gallery-progress {
+  position: absolute; inset: 0;
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  gap: 6px; pointer-events: none;
+}
+.gallery-progress svg { display: block; }
+.gallery-progress-label {
+  font-size: 10px; color: #ccc; font-variant-numeric: tabular-nums;
 }
 
 /* Result modal */
@@ -398,12 +413,13 @@ html, body { width: 100%; height: 100%; background: #1a1a1a; color: #eee; font-f
   display: none;
 }
 #status-bar.visible { display: block; }
+
 </style>
 </head>
 <body>
 <div id="app">
   <div id="toolbar">
-    <div class="app-title">CLO × NVIDIA COSMOS</div>
+    <div class="app-title"><span id="zprj-title">sample.zprj</span> → Diffusion Renderer</div>
   </div>
 
   <aside id="sidebar">
@@ -426,6 +442,13 @@ html, body { width: 100%; height: 100%; background: #1a1a1a; color: #eee; font-f
         <div class="hdr-thumbs" id="hdr-thumbs"></div>
         <label class="btn block-btn" for="hdr-file" style="margin-top:8px;">Upload HDR…</label>
         <input type="file" id="hdr-file" accept=".hdr" style="display:none">
+      </section>
+      <section class="side-section">
+        <div class="side-section-title">Camera</div>
+        <div class="slider-row">
+          <label class="slider-label" for="fov-slider">FOV <span id="fov-val">15</span>°</label>
+          <input type="range" id="fov-slider" min="5" max="60" step="1" value="15">
+        </div>
       </section>
       <section class="side-section">
         <button id="render-btn" class="primary-btn">Render</button>

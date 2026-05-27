@@ -10,13 +10,14 @@ import { decodeRGBE, tonemapToImageData } from './rgbe.js';
 
 const RENDER_W = 1280;
 const RENDER_H = 704;
-const BG_PRESETS = ['image_1', 'image_2', 'image_5', 'image_10'];
+const BG_PRESETS = []; // populated at runtime from /bg_presets
 const HDR_PRESETS = ['sunny_vondelpark_1k', 'pink_sunrise_1k', 'street_lamp_1k', 'circus_arena_1k'];
 const GBUFFER_NAMES = ['basecolor', 'normal', 'depth', 'roughness'];
 
 let activeBgPreset = null;
 let activeHdr = HDR_PRESETS[0];
 let currentActorsData = null;
+let activeFov = 15;
 
 function setShaderReplacements(mapper, replacements) {
   const vsp = mapper.getViewSpecificProperties();
@@ -471,12 +472,14 @@ function refreshGallery() {
         img.src = item.resultUrl;
         el.appendChild(img);
       }
-    } else if (item.gbuffers.basecolor) {
-      // While result is loading, show the basecolor capture as placeholder
-      const img = document.createElement('img');
-      img.src = item.gbuffers.basecolor;
-      img.style.opacity = '0.35';
-      el.appendChild(img);
+    } else {
+      if (item.gbuffers.basecolor) {
+        const img = document.createElement('img');
+        img.src = item.gbuffers.basecolor;
+        img.style.opacity = '0.25';
+        el.appendChild(img);
+      }
+      el.appendChild(makePendingSVG());
     }
     const stamp = document.createElement('div');
     stamp.className = 'stamp';
@@ -527,6 +530,111 @@ function makeBlackBlob(w, h) {
   return new Promise((resolve) => c.toBlob(resolve, 'image/png'));
 }
 
+function makeBlackDataUrl(w, h) {
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  c.getContext('2d').fillRect(0, 0, w, h);
+  return c.toDataURL('image/png');
+}
+
+// ── SSE render progress ─────────────────────────────────────────────
+
+// Circular SVG progress: radius 22, stroke-width 4
+const _CIRC_R = 22;
+const _CIRC_STROKE = 4;
+const _CIRC_C = _CIRC_R + _CIRC_STROKE;          // cx = cy = 26
+const _CIRC_SIZE = (_CIRC_R + _CIRC_STROKE) * 2; // 52
+const _CIRC_CIRCUMFERENCE = 2 * Math.PI * _CIRC_R;
+
+function makePendingSVG() {
+  const ns = 'http://www.w3.org/2000/svg';
+  const wrap = document.createElement('div');
+  wrap.className = 'gallery-progress';
+
+  const svg = document.createElementNS(ns, 'svg');
+  svg.setAttribute('width', _CIRC_SIZE);
+  svg.setAttribute('height', _CIRC_SIZE);
+  svg.setAttribute('viewBox', `0 0 ${_CIRC_SIZE} ${_CIRC_SIZE}`);
+
+  // Track circle
+  const track = document.createElementNS(ns, 'circle');
+  track.setAttribute('cx', _CIRC_C);
+  track.setAttribute('cy', _CIRC_C);
+  track.setAttribute('r', _CIRC_R);
+  track.setAttribute('fill', 'none');
+  track.setAttribute('stroke', 'rgba(255,255,255,0.12)');
+  track.setAttribute('stroke-width', _CIRC_STROKE);
+  svg.appendChild(track);
+
+  // Progress arc
+  const arc = document.createElementNS(ns, 'circle');
+  arc.setAttribute('cx', _CIRC_C);
+  arc.setAttribute('cy', _CIRC_C);
+  arc.setAttribute('r', _CIRC_R);
+  arc.setAttribute('fill', 'none');
+  arc.setAttribute('stroke', '#c95a2e');
+  arc.setAttribute('stroke-width', _CIRC_STROKE);
+  arc.setAttribute('stroke-linecap', 'round');
+  arc.setAttribute('stroke-dasharray', _CIRC_CIRCUMFERENCE);
+  arc.setAttribute('stroke-dashoffset', _CIRC_CIRCUMFERENCE); // 0% initially
+  arc.setAttribute('transform', `rotate(-90 ${_CIRC_C} ${_CIRC_C})`);
+  arc.dataset.progressArc = '1';
+  svg.appendChild(arc);
+
+  // Percentage text
+  const text = document.createElementNS(ns, 'text');
+  text.setAttribute('x', _CIRC_C);
+  text.setAttribute('y', _CIRC_C + 1);
+  text.setAttribute('text-anchor', 'middle');
+  text.setAttribute('dominant-baseline', 'middle');
+  text.setAttribute('fill', '#ddd');
+  text.setAttribute('font-size', '10');
+  text.setAttribute('font-family', 'system-ui, sans-serif');
+  text.dataset.progressPct = '1';
+  text.textContent = '0%';
+  svg.appendChild(text);
+
+  const label = document.createElement('div');
+  label.className = 'gallery-progress-label';
+  label.dataset.progressLabel = '1';
+  label.textContent = 'Preparing…';
+
+  wrap.appendChild(svg);
+  wrap.appendChild(label);
+  return wrap;
+}
+
+function _updatePendingItems(step, total) {
+  const pct = total > 0 ? Math.round((step / total) * 100) : 0;
+  const offset = _CIRC_CIRCUMFERENCE * (1 - pct / 100);
+  for (const arc of document.querySelectorAll('[data-progress-arc]')) {
+    arc.setAttribute('stroke-dashoffset', offset);
+  }
+  for (const t of document.querySelectorAll('[data-progress-pct]')) {
+    t.textContent = pct + '%';
+  }
+  for (const l of document.querySelectorAll('[data-progress-label]')) {
+    l.textContent = total > 0 ? `Step ${step} / ${total}` : 'Preparing…';
+  }
+}
+
+let _sseSource = null;
+
+function startProgressSSE() {
+  if (_sseSource) return;
+  _sseSource = new EventSource('/progress');
+  _sseSource.onmessage = (e) => {
+    const ev = JSON.parse(e.data);
+    if (ev.phase === 'start') {
+      _updatePendingItems(0, 0);
+    } else if (ev.phase === 'denoising') {
+      _updatePendingItems(ev.step, ev.total);
+    }
+    // 'done' — HTTP response completes and refreshGallery() replaces the pending item
+  };
+  _sseSource.onerror = () => {};
+}
+
 async function renderViaServer(panels, mode = 'still') {
   const renderBtn = document.getElementById('render-btn');
   const rotateBtn = document.getElementById('rotate-light-btn');
@@ -559,8 +667,11 @@ async function renderViaServer(panels, mode = 'still') {
       item.gbuffers[name] = URL.createObjectURL(blob);
       formData.append(name, blob, `${name}.png`);
     }
-    // Always send a black metallic placeholder
-    const metallicBlob = await makeBlackBlob(RENDER_W, RENDER_H);
+    // Metallic: composite with background if available, else black
+    const metallicBgUrl = activeBgPreset ? `/inverse/${activeBgPreset}/metallic.png` : null;
+    const metallicBlob = metallicBgUrl
+      ? await compositeCapture(makeBlackDataUrl(RENDER_W, RENDER_H), metallicBgUrl)
+      : await makeBlackBlob(RENDER_W, RENDER_H);
     item.gbuffers.metallic = URL.createObjectURL(metallicBlob);
     formData.append('metallic', metallicBlob, 'metallic.png');
     refreshGallery();
@@ -616,7 +727,7 @@ async function buildAndPopulate(scene, panels) {
   panels[2].floorActor = populateDepth(panels[2].renderer, actorsData, floorPD);
   panels[3].floorActor = populateRoughness(panels[3].renderer, actorsData, floorPD);
 
-  frameCameras(panels, actorsData);
+  frameCameras(panels, actorsData, activeFov);
   for (const p of panels) p.renderWindow.render();
 }
 
@@ -800,20 +911,27 @@ async function main() {
   document.getElementById('depth-far').addEventListener('input', () => depthSliderChanged(panels, 'far'));
   document.getElementById('depth-fit').addEventListener('click', () => autoFitDepth(panels));
 
-  // Background preset thumbnails
+  // Background preset thumbnails — loaded dynamically from server
   const thumbs = document.getElementById('bg-thumbs');
   const clearThumb = document.createElement('div');
   clearThumb.className = 'bg-thumb clear active';
   clearThumb.textContent = 'None';
   clearThumb.dataset.preset = '';
   thumbs.appendChild(clearThumb);
-  for (const preset of BG_PRESETS) {
-    const t = document.createElement('div');
-    t.className = 'bg-thumb';
-    t.style.backgroundImage = `url(/inverse/${preset}/rgb_input.png)`;
-    t.dataset.preset = preset;
-    t.title = preset;
-    thumbs.appendChild(t);
+  try {
+    const bgResp = await fetch('/bg_presets');
+    const presets = await bgResp.json();
+    BG_PRESETS.push(...presets);
+    for (const preset of presets) {
+      const t = document.createElement('div');
+      t.className = 'bg-thumb';
+      t.style.backgroundImage = `url(/inverse/${preset}/rgb_input.png)`;
+      t.dataset.preset = preset;
+      t.title = preset;
+      thumbs.appendChild(t);
+    }
+  } catch (e) {
+    console.warn('Failed to load bg presets', e);
   }
   thumbs.addEventListener('click', (e) => {
     const t = e.target.closest('.bg-thumb');
@@ -883,6 +1001,18 @@ async function main() {
     e.target.value = '';
   });
 
+  // FOV slider
+  const fovSlider = document.getElementById('fov-slider');
+  const fovVal = document.getElementById('fov-val');
+  fovSlider.addEventListener('input', () => {
+    activeFov = parseInt(fovSlider.value, 10);
+    fovVal.textContent = activeFov;
+    if (currentActorsData) {
+      frameCameras(panels, currentActorsData, activeFov);
+      for (const p of panels) p.renderWindow.render();
+    }
+  });
+
   // Render buttons
   document.getElementById('render-btn').addEventListener('click', () => {
     renderViaServer(panels, 'still');
@@ -915,6 +1045,7 @@ async function main() {
       await buildAndPopulate(newScene, panels);
       autoFitDepth(panels);
       document.getElementById('zprj-name').textContent = file.name;
+      document.getElementById('zprj-title').textContent = file.name;
     } catch (err) {
       console.error(err);
       alert('Failed to load: ' + err.message);
@@ -924,6 +1055,8 @@ async function main() {
   });
 
   document.getElementById('loading').classList.add('hidden');
+
+  startProgressSSE();
 
   window.addEventListener('resize', () => {
     for (const p of panels) p.grw.resize();
