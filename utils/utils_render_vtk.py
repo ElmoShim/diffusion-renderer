@@ -124,6 +124,7 @@ def _make_polydata(vertices, faces, normals=None):
         gen = vtk.vtkPolyDataNormals()
         gen.SetInputData(pd)
         gen.ComputePointNormalsOn()
+        gen.SplittingOff()
         gen.Update()
         pd = gen.GetOutput()
     return pd
