@@ -71,6 +71,136 @@ export function makePolyData(positions, indices, vertexCount, triangleCount, nor
   return normalsFilter.getOutputData();
 }
 
+// ── Image DPI parsing ─────────────────────────────────────────────────────
+
+function _u16be(b, i) { return ((b[i] & 0xFF) << 8) | (b[i + 1] & 0xFF); }
+function _u32be(b, i) {
+  return (((b[i] & 0xFF) << 24) | ((b[i+1] & 0xFF) << 16) |
+          ((b[i+2] & 0xFF) << 8)  |  (b[i+3] & 0xFF)) >>> 0;
+}
+
+// Parse JPEG or PNG raw bytes → { widthPx, heightPx, dpiX, dpiY }.
+// Defaults to 72 DPI when metadata is absent.
+function parseImageMeta(raw) {
+  const b = new Uint8Array(raw.length);
+  for (let j = 0; j < raw.length; j++) b[j] = raw[j];
+
+  // ── JPEG ──────────────────────────────────────────────────────────────
+  if (b[0] === 0xFF && b[1] === 0xD8) {
+    let w = 0, h = 0, dpiX = 72, dpiY = 72;
+    let i = 2;
+    while (i + 3 < b.length) {
+      if (b[i] !== 0xFF) break;
+      while (i < b.length && b[i] === 0xFF) i++; // skip fill bytes
+      const m = b[i++];
+      if (m === 0xD9 || m === 0xDA) break;
+      const segLen = _u16be(b, i);
+      const d = i + 2; // segment data start
+
+      if (m === 0xE0 && b[d] === 0x4A && b[d + 1] === 0x46) {
+        // JFIF APP0: d+7=units, d+8..9=Xdensity, d+10..11=Ydensity
+        const units = b[d + 7];
+        const xd = _u16be(b, d + 8), yd = _u16be(b, d + 10);
+        if (xd > 0 && yd > 0) {
+          dpiX = units === 1 ? xd : units === 2 ? xd * 2.54 : dpiX;
+          dpiY = units === 1 ? yd : units === 2 ? yd * 2.54 : dpiY;
+        }
+      } else if (m === 0xE1 && b[d] === 0x45 && b[d + 1] === 0x78) {
+        // Exif APP1 — minimal TIFF IFD reader for XResolution/YResolution
+        const t = d + 6; // TIFF header base (after "Exif\0\0")
+        const le = b[t] === 0x49; // 'I' = Intel/little-endian
+        const rd16 = le
+          ? (o) => (b[t + o] & 0xFF) | ((b[t + o + 1] & 0xFF) << 8)
+          : (o) => _u16be(b, t + o);
+        const rd32 = le
+          ? (o) => (((b[t+o] & 0xFF) | ((b[t+o+1] & 0xFF) << 8) |
+                      ((b[t+o+2] & 0xFF) << 16) | ((b[t+o+3] & 0xFF) << 24)) >>> 0)
+          : (o) => _u32be(b, t + o);
+        const rational = (o) => { const n = rd32(o), den = rd32(o + 4); return den ? n / den : 0; };
+        try {
+          const ifdOff = rd32(4);
+          const cnt = rd16(ifdOff);
+          let xr = 0, yr = 0, unit = 2;
+          for (let e = 0; e < cnt; e++) {
+            const ep = ifdOff + 2 + e * 12;
+            const tag = rd16(ep);
+            if (tag === 0x011A) xr = rational(rd32(ep + 8));
+            else if (tag === 0x011B) yr = rational(rd32(ep + 8));
+            else if (tag === 0x0128) unit = rd16(ep + 8);
+          }
+          if (xr > 0 && yr > 0 && dpiX === 72 && dpiY === 72) {
+            dpiX = unit === 3 ? xr * 2.54 : xr;
+            dpiY = unit === 3 ? yr * 2.54 : yr;
+          }
+        } catch { /* ignore malformed Exif */ }
+      } else if (m >= 0xC0 && m <= 0xCF && m !== 0xC4 && m !== 0xC8 && m !== 0xCC) {
+        // SOF marker → image dimensions
+        h = _u16be(b, d + 1);
+        w = _u16be(b, d + 3);
+      }
+      i += segLen;
+    }
+    return { widthPx: w, heightPx: h, dpiX, dpiY };
+  }
+
+  // ── PNG ───────────────────────────────────────────────────────────────
+  if (b[0] === 0x89 && b[1] === 0x50) {
+    const w = _u32be(b, 16), h = _u32be(b, 20);
+    let dpiX = 72, dpiY = 72;
+    let ci = 8;
+    while (ci + 12 < b.length) {
+      const cLen = _u32be(b, ci);
+      const cType = String.fromCharCode(b[ci+4], b[ci+5], b[ci+6], b[ci+7]);
+      if (cType === 'pHYs' && cLen >= 9) {
+        const ppuX = _u32be(b, ci + 8), ppuY = _u32be(b, ci + 12);
+        if (b[ci + 16] === 1 && ppuX > 0 && ppuY > 0) { // unit = metre
+          dpiX = ppuX / 39.3701;
+          dpiY = ppuY / 39.3701;
+        }
+      }
+      if (cType === 'IDAT' || cType === 'IEND') break;
+      ci += 12 + cLen;
+    }
+    return { widthPx: w, heightPx: h, dpiX, dpiY };
+  }
+
+  return { widthPx: 0, heightPx: 0, dpiX: 72, dpiY: 72 };
+}
+
+// Return { tw, th } tile size in mm derived from image DPI (matches CLO's rule).
+// Falls back to mat.tileWidth / mat.tileHeight when the image is unavailable.
+function getTextureTileMm(scene, texPath, mat, cache) {
+  const fallback = {
+    tw: mat && mat.tileWidth > 0 ? mat.tileWidth : 1,
+    th: mat && mat.tileHeight > 0 ? mat.tileHeight : 1,
+  };
+  if (!texPath) return fallback;
+  if (cache && cache.has(texPath)) return cache.get(texPath);
+
+  try {
+    if (!scene.hasFile(texPath)) {
+      if (cache) cache.set(texPath, fallback);
+      return fallback;
+    }
+    const raw = scene.readFile(texPath);
+    if (!raw || raw.length === 0) {
+      if (cache) cache.set(texPath, fallback);
+      return fallback;
+    }
+    const { widthPx, heightPx, dpiX, dpiY } = parseImageMeta(raw);
+    if (widthPx > 0 && heightPx > 0 && dpiX > 0 && dpiY > 0) {
+      const result = { tw: (widthPx / dpiX) * 25.4, th: (heightPx / dpiY) * 25.4 };
+      if (cache) cache.set(texPath, result);
+      return result;
+    }
+  } catch { /* fall through */ }
+
+  if (cache) cache.set(texPath, fallback);
+  return fallback;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 export function setTexCoords(polyData, uvs, vertexCount, tileWidth, tileHeight, texTransform) {
   const tw = tileWidth > 0 ? tileWidth : 1;
   const th = tileHeight > 0 ? tileHeight : 1;
@@ -78,6 +208,17 @@ export function setTexCoords(polyData, uvs, vertexCount, tileWidth, tileHeight, 
   for (let i = 0; i < vertexCount; i++) {
     scaled[i * 2] = uvs[i * 2] / tw;
     scaled[i * 2 + 1] = uvs[i * 2 + 1] / th;
+  }
+  // scaleU/V encodes the user's texture zoom; 0.001 == 100% (CLO default).
+  const SCALE_ONE = 0.001;
+  const su = texTransform?.scaleU ?? SCALE_ONE;
+  const sv = texTransform?.scaleV ?? SCALE_ONE;
+  if (Math.abs(su - SCALE_ONE) > 1e-7 || Math.abs(sv - SCALE_ONE) > 1e-7) {
+    const fu = su / SCALE_ONE, fv = sv / SCALE_ONE;
+    for (let i = 0; i < vertexCount; i++) {
+      scaled[i * 2] *= fu;
+      scaled[i * 2 + 1] *= fv;
+    }
   }
   const angle = texTransform?.rotation ?? 0;
   if (angle) {
@@ -172,6 +313,7 @@ function normalizeColor(c) {
 export async function buildSceneActors(scene) {
   const actors = [];
   const texCache = new Map();
+  const tileMmCache = new Map();
   const cwIdx = scene.activeColorwayIndex;
 
   // Garment patterns
@@ -209,7 +351,8 @@ export async function buildSceneActors(scene) {
 
       if (diffuseTex || roughnessTex) {
         const uvs = pattern.getUVs();
-        setTexCoords(polyData, uvs, pattern.vertexCount, mat.tileWidth, mat.tileHeight, mat.diffuseTextureTransform);
+        const { tw, th } = getTextureTileMm(scene, mat.diffuseTexturePath, mat, tileMmCache);
+        setTexCoords(polyData, uvs, pattern.vertexCount, tw, th, mat.diffuseTextureTransform);
       }
     }
 

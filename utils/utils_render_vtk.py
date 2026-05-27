@@ -206,13 +206,63 @@ def _load_vtk_texture_grayscale(scene, texture_path):
     return tex
 
 
-def _compute_tcoords(pattern, material):
+def _image_tile_mm(scene, texture_path, cache=None):
+    """Return (width_mm, height_mm) of one texture tile derived from image DPI.
+
+    CLO determines the physical texture repeat from the image's embedded DPI
+    metadata: tile_mm = (pixels / dpi) * 25.4.  Falls back to None when the
+    image cannot be read so callers can use tile_width/height instead.
+    """
+    if cache is not None and texture_path in cache:
+        return cache[texture_path]
+
+    data = scene.read_file(texture_path)
+    if not data:
+        data = scene.read_file(os.path.basename(texture_path))
+    if not data:
+        return None
+
+    try:
+        img = Image.open(io.BytesIO(data))
+        w_px, h_px = img.size
+        dpi = img.info.get("dpi", (72.0, 72.0))
+        dpi_x = float(dpi[0]) if dpi[0] > 0 else 72.0
+        dpi_y = float(dpi[1]) if dpi[1] > 0 else 72.0
+        result = ((w_px / dpi_x) * 25.4, (h_px / dpi_y) * 25.4)
+        if cache is not None:
+            cache[texture_path] = result
+        return result
+    except Exception:
+        return None
+
+
+def _compute_tcoords(pattern, material, scene=None, tile_cache=None):
     uvs = np.array(pattern.uvs).reshape(-1, 2).copy()
-    tw = material.tile_width if material.tile_width > 0 else 1.0
-    th = material.tile_height if material.tile_height > 0 else 1.0
+
+    # Derive tile size from image DPI (matches CLO's physical-scale computation).
+    # Fall back to tile_width/height only when the image is unavailable.
+    tw = th = None
+    if scene and getattr(material, "diffuse_texture_path", None):
+        tile = _image_tile_mm(scene, material.diffuse_texture_path, tile_cache)
+        if tile:
+            tw, th = tile
+    if tw is None:
+        tw = material.tile_width if material.tile_width > 0 else 1.0
+        th = material.tile_height if material.tile_height > 0 else 1.0
+
     uvs[:, 0] /= tw
     uvs[:, 1] /= th
+
     xf = material.diffuse_texture_transform
+    # scale_u/v encodes the user's texture zoom; 0.001 == 100% (CLO default).
+    su = getattr(xf, "scale_u", 0.001)
+    sv = getattr(xf, "scale_v", 0.001)
+    _SCALE_ONE = 0.001
+    if su and abs(su - _SCALE_ONE) > 1e-7:
+        uvs[:, 0] *= su / _SCALE_ONE
+    if sv and abs(sv - _SCALE_ONE) > 1e-7:
+        uvs[:, 1] *= sv / _SCALE_ONE
+
     angle = getattr(xf, "rotation", 0.0)
     if angle:
         r = math.radians(angle)
@@ -294,6 +344,7 @@ def build_scene_actors(scene, background=True):
         polydata, material, has_tcoords, diffuse_color, roughness, metallic, type
     """
     actors_data = []
+    tile_cache = {}
 
     # Garment patterns
     for i, pat in enumerate(scene.garment_patterns):
@@ -310,7 +361,7 @@ def build_scene_actors(scene, background=True):
         mat = _get_pattern_material(scene, i)
         has_tcoords = False
         if mat and pat.uv_vertex_count == nv:
-            tcoords = _compute_tcoords(pat, mat)
+            tcoords = _compute_tcoords(pat, mat, scene, tile_cache)
             tc_arr = numpy_support.numpy_to_vtk(tcoords.astype(np.float32), deep=True)
             tc_arr.SetNumberOfComponents(2)
             pd.GetPointData().SetTCoords(tc_arr)
