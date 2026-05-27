@@ -311,6 +311,18 @@ def _load_fabric_rgba_texture(scene, material):
     return tex, has_alpha
 
 
+def _load_normal_texture(scene, texture_path):
+    """Tangent-space normal map as a LINEAR (non-sRGB) vtkTexture.
+
+    Normal maps encode XYZ vectors, not color, so they must not be gamma
+    decoded — that would skew the perturbed surface normals.
+    """
+    tex = _load_vtk_texture(scene, texture_path)
+    if tex is not None:
+        tex.SetUseSRGBColorSpace(False)
+    return tex
+
+
 def _texture_tile_size(material):
     """Displayed texture tile size (width, height) in mm for a fabric.
 
@@ -666,6 +678,35 @@ def enable_translucency(ren):
     ren.SetOcclusionRatio(0.0)
 
 
+def _apply_opacity_alpha(actor, op_tex):
+    """Make an unlit color actor translucent, driving its alpha from the opacity
+    map (bound as "opacityTex"). For color G-buffers (basecolor/roughness/
+    metallic) so knit gaps blend toward the background — needs depth peeling."""
+    actor.GetProperty().SetTexture("opacityTex", op_tex)
+    sp = vtk.vtkShaderProperty()
+    sp.AddFragmentShaderReplacement(
+        "//VTK::Light::Impl", True,
+        "//VTK::Light::Impl\n"
+        "  gl_FragData[0].a = texture(opacityTex, tcoordVCVSOutput).r;\n",
+        False)
+    actor.SetShaderProperty(sp)
+    actor.ForceTranslucentOn()
+
+
+def _apply_opacity_discard(actor, op_tex, threshold=0.5):
+    """Discard fragments the opacity map marks transparent (bound as
+    "opacityTex"). For the depth pass, where a value can't be blended — the
+    discarded gap reveals the depth of whatever is behind the fabric."""
+    actor.GetProperty().SetTexture("opacityTex", op_tex)
+    sp = vtk.vtkShaderProperty()
+    sp.AddFragmentShaderReplacement(
+        "//VTK::TCoord::Impl", True,
+        "//VTK::TCoord::Impl\n"
+        f"  if (texture(opacityTex, tcoordVCVSOutput).r < {threshold}) discard;\n",
+        False)
+    actor.SetShaderProperty(sp)
+
+
 def populate_gbuffer_renderer(ren, kind, actors_data, scene, tex_cache):
     """Add actors to `ren` configured for G-buffer `kind`
     ('basecolor' | 'normal' | 'roughness' | 'metallic'), and set the renderer's
@@ -678,14 +719,6 @@ def populate_gbuffer_renderer(ren, kind, actors_data, scene, tex_cache):
     """
     if kind in GBUFFER_BACKGROUND:
         ren.SetBackground(*GBUFFER_BACKGROUND[kind])
-
-    if kind == "normal":
-        normal_sp = vtk.vtkShaderProperty()
-        normal_sp.SetVertexShaderCode(NORMAL_VERT)
-        normal_sp.SetFragmentShaderCode(NORMAL_FRAG)
-        normal_op_sp = vtk.vtkShaderProperty()  # alpha-from-opacity variant
-        normal_op_sp.SetVertexShaderCode(NORMAL_VERT)
-        normal_op_sp.SetFragmentShaderCode(NORMAL_FRAG_OPACITY)
 
     for ad in actors_data:
         mapper = vtk.vtkPolyDataMapper()
@@ -714,13 +747,44 @@ def populate_gbuffer_renderer(ren, kind, actors_data, scene, tex_cache):
 
         elif kind == "normal":
             mapper.SetScalarVisibility(False)
+            ntex = None
+            if ad["has_tcoords"] and mat and getattr(mat, "normal_texture_path", None):
+                nkey = ("normaltex", mat.normal_texture_path)
+                if nkey not in tex_cache:
+                    tex_cache[nkey] = _load_normal_texture(scene, mat.normal_texture_path)
+                ntex = tex_cache[nkey]
+
+            if ntex:
+                # Normal mapping needs tangents + a lit interpolation model so
+                # VTK perturbs normalVCVSOutput with the map before we read it.
+                tkey = ("tangents", id(ad["polydata"]))
+                if tkey not in tex_cache:
+                    tg = vtk.vtkPolyDataTangents()
+                    tg.SetInputData(ad["polydata"])
+                    tg.Update()
+                    tex_cache[tkey] = tg.GetOutput()
+                mapper.SetInputData(tex_cache[tkey])
+                prop.SetInterpolationToPBR()
+                prop.SetNormalTexture(ntex)
+                prop.SetNormalScale(max(0.0, getattr(mat, "normal_intensity_percent", 100) / 100.0))
+            else:
+                prop.SetInterpolationToPhong()  # per-fragment normalVCVSOutput
+
             op_tex = _opacity_texture_for(ad, scene, tex_cache)
+            alpha = "texture(opacityTex, tcoordVCVSOutput).r" if op_tex else "1.0"
+            sp = vtk.vtkShaderProperty()
+            # //VTK::Normal::Impl (earlier in the shader) has already applied the
+            # normal map to normalVCVSOutput; emit it as the G-buffer color.
+            sp.AddFragmentShaderReplacement(
+                "//VTK::Light::Impl", True,
+                "  vec3 nrm = normalize(normalVCVSOutput);\n"
+                "  if (nrm.z < 0.0) nrm = -nrm;\n"
+                f"  gl_FragData[0] = vec4(nrm * 0.5 + 0.5, {alpha});\n",
+                False)
             if op_tex:
                 prop.SetTexture("opacityTex", op_tex)
-                actor.SetShaderProperty(normal_op_sp)
                 actor.ForceTranslucentOn()
-            else:
-                actor.SetShaderProperty(normal_sp)
+            actor.SetShaderProperty(sp)
 
         elif kind == "roughness":
             mapper.SetScalarVisibility(False)
@@ -735,6 +799,9 @@ def populate_gbuffer_renderer(ren, kind, actors_data, scene, tex_cache):
                     tex_cache[key] = _load_vtk_texture_grayscale(scene, mat.roughness_texture_path)
                 if tex_cache[key]:
                     actor.SetTexture(tex_cache[key])
+            op_tex = _opacity_texture_for(ad, scene, tex_cache)
+            if op_tex:
+                _apply_opacity_alpha(actor, op_tex)
 
         elif kind == "metallic":
             mapper.SetScalarVisibility(False)
@@ -749,6 +816,9 @@ def populate_gbuffer_renderer(ren, kind, actors_data, scene, tex_cache):
                     tex_cache[key] = _load_vtk_texture_grayscale(scene, mat.metalness_texture_path)
                 if tex_cache[key]:
                     actor.SetTexture(tex_cache[key])
+            op_tex = _opacity_texture_for(ad, scene, tex_cache)
+            if op_tex:
+                _apply_opacity_alpha(actor, op_tex)
 
         ren.AddActor(actor)
 
@@ -809,7 +879,9 @@ def render_gbuffers(scene, resolution=512, fov_deg=20.0, azimuth_deg=0.0,
         populate_gbuffer_renderer(ren, kind, actors_data, scene, tex_cache)
         gb[kind] = _to_tensor(_capture_rgb(win))
 
-    # --- Depth (from Z-buffer; plain opaque actors, holes don't punch depth) ---
+    # --- Depth (from Z-buffer) ---
+    # Opacity-mapped fabrics discard their transparent texels so the gap reveals
+    # the depth of whatever is behind (the body), instead of the fabric surface.
     ren.SetBackground(1, 1, 1)
     ren.RemoveAllViewProps()
     for ad in actors_data:
@@ -818,6 +890,9 @@ def render_gbuffers(scene, resolution=512, fov_deg=20.0, azimuth_deg=0.0,
         mapper.SetScalarVisibility(False)
         actor = vtk.vtkActor()
         actor.SetMapper(mapper)
+        op_tex = _opacity_texture_for(ad, scene, tex_cache)
+        if op_tex:
+            _apply_opacity_discard(actor, op_tex)
         ren.AddActor(actor)
     zbuf = _capture_zbuffer(win)
     valid = zbuf[zbuf < 1.0 - 1e-6]

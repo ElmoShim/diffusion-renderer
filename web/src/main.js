@@ -73,9 +73,15 @@ function createPanel(panelEl, bgColor = [0, 0, 0]) {
   const grw = vtkGenericRenderWindow.newInstance({ background: bgColor });
   grw.setContainer(canvasWrap);
   grw.resize();
+  // Order-independent transparency for opacity-mapped fabrics: without it the
+  // sweater's front and back translucent layers blend to near-opaque.
+  const renderer = grw.getRenderer();
+  renderer.setUseDepthPeeling(true);
+  renderer.setMaximumNumberOfPeels(8);
+  renderer.setOcclusionRatio(0);
   return {
     panelEl, grw,
-    renderer: grw.getRenderer(),
+    renderer,
     renderWindow: grw.getRenderWindow(),
     openGLRenderWindow: grw.getApiSpecificRenderWindow(),
     floorActor: null,
@@ -143,17 +149,40 @@ function frameCameras(panels, actorsData, fovDeg = 15) {
 
 // ── Shader configs ──────────────────────────────────────────────────
 
+// Output the view-space normal as color. Camera looks along -Z, so a
+// front-facing normal has z > 0; flip back-facing ones toward the camera.
+const NORMAL_BODY =
+  'vec3 n = normalize(normalVCVSOutput);\n' +
+  'if (n.z < 0.0) n = -n;';
+
 const NORMAL_SHADER = [
   {
     shaderType: 'Fragment',
     originalValue: '//VTK::Light::Impl',
-    replacementValue: `
-      vec3 n = normalize(normalVCVSOutput);
-      // Force normal toward camera. In view space, camera looks along -Z
-      // (objects in front have negative z, so the outward normal has z > 0).
-      if (n.z < 0.0) n = -n;
-      gl_FragData[0] = vec4(n * 0.5 + 0.5, 1.0);
-    `,
+    replacementValue: `${NORMAL_BODY}\n      gl_FragData[0] = vec4(n * 0.5 + 0.5, 1.0);`,
+    replaceFirst: true,
+  },
+];
+
+// Opacity variant: alpha from the opacity map bound as texture1 (white RGB +
+// opacity alpha). VTK.js's automatic opacity *= texture1.a doesn't apply, so we
+// sample the alpha explicitly. Used with forceTranslucent + depth peeling.
+const NORMAL_OPACITY_SHADER = [
+  {
+    shaderType: 'Fragment',
+    originalValue: '//VTK::Light::Impl',
+    replacementValue: `${NORMAL_BODY}\n      gl_FragData[0] = vec4(n * 0.5 + 0.5, texture2D(texture1, tcoordVCVSOutput).a);`,
+    replaceFirst: true,
+  },
+];
+
+// For color G-buffers (basecolor/roughness): keep VTK.js's color/lighting, then
+// override the fragment alpha with the opacity map (texture1.a).
+const OPACITY_ALPHA_SHADER = [
+  {
+    shaderType: 'Fragment',
+    originalValue: '//VTK::Light::Impl',
+    replacementValue: '//VTK::Light::Impl\n      gl_FragData[0].a = texture2D(texture1, tcoordVCVSOutput).a;',
     replaceFirst: true,
   },
 ];
@@ -183,6 +212,23 @@ const DEPTH_SHADER = [
     shaderType: 'Fragment',
     originalValue: '//VTK::Light::Impl',
     replacementValue: `
+      float distFromFocal = (-vertexVCVSOutput.z) - u_focalDist;
+      float d = clamp((distFromFocal - u_depthNear) / max(u_depthFar - u_depthNear, 1e-6), 0.0, 1.0);
+      gl_FragData[0] = vec4(vec3(d), 1.0);
+    `,
+    replaceFirst: true,
+  },
+];
+
+// Depth variant that discards opacity-map holes (texture1.a) so the depth
+// behind the fabric shows through.
+const DEPTH_OPACITY_SHADER = [
+  DEPTH_SHADER[0],
+  {
+    shaderType: 'Fragment',
+    originalValue: '//VTK::Light::Impl',
+    replacementValue: `
+      if (texture2D(texture1, tcoordVCVSOutput).a < 0.5) discard;
       float distFromFocal = (-vertexVCVSOutput.z) - u_focalDist;
       float d = clamp((distFromFocal - u_depthNear) / max(u_depthFar - u_depthNear, 1e-6), 0.0, 1.0);
       gl_FragData[0] = vec4(vec3(d), 1.0);
@@ -240,6 +286,13 @@ function populateBasecolor(renderer, actorsData, floorPD) {
     prop.setSpecular(0.0);
     prop.setColor(...ad.diffuseColor);
     if (ad.diffuseTex) actor.addTexture(ad.diffuseTex);
+    if (ad.hasOpacity && ad.diffuseTex) {
+      // VTK.js's automatic `opacity *= texture1.a` doesn't take effect here, so
+      // sample the alpha explicitly in the shader. forceTranslucent + depth
+      // peeling then blend knit gaps over the background.
+      setShaderReplacements(mapper, OPACITY_ALPHA_SHADER);
+      actor.setForceTranslucent(true);
+    }
     renderer.addActor(actor);
   }
   return addFloorActor(renderer, floorPD, [0.5, 0.5, 0.5], null);
@@ -249,9 +302,16 @@ function populateNormal(renderer, actorsData, floorPD) {
   for (const ad of actorsData) {
     const mapper = vtkMapper.newInstance();
     mapper.setInputData(ad.polyData);
-    setShaderReplacements(mapper, NORMAL_SHADER);
+    const useOpacity = ad.hasOpacity && ad.opacityTex;
+    setShaderReplacements(mapper, useOpacity ? NORMAL_OPACITY_SHADER : NORMAL_SHADER);
     const actor = vtkActor.newInstance();
     actor.setMapper(mapper);
+    if (useOpacity) {
+      // Bind the opacity map (white RGB + alpha) as texture1; the shader reads
+      // texture1.a for the fragment alpha and blends knit gaps over the bg.
+      actor.addTexture(ad.opacityTex);
+      actor.setForceTranslucent(true);
+    }
     renderer.addActor(actor);
   }
   return addFloorActor(renderer, floorPD, [0.5, 0.5, 0.5], NORMAL_SHADER);
@@ -261,10 +321,13 @@ function populateDepth(renderer, actorsData, floorPD) {
   for (const ad of actorsData) {
     const mapper = vtkMapper.newInstance();
     mapper.setInputData(ad.polyData);
-    setShaderReplacements(mapper, DEPTH_SHADER);
+    const useOpacity = ad.hasOpacity && ad.opacityTex;
+    setShaderReplacements(mapper, useOpacity ? DEPTH_OPACITY_SHADER : DEPTH_SHADER);
     addDepthUniformCallback(mapper);
     const actor = vtkActor.newInstance();
     actor.setMapper(mapper);
+    // Bind the opacity map so the shader discards knit gaps (reveals depth behind).
+    if (useOpacity) actor.addTexture(ad.opacityTex);
     renderer.addActor(actor);
   }
   const floorActor = addFloorActor(renderer, floorPD, [1, 1, 1], DEPTH_SHADER);
@@ -284,7 +347,14 @@ function populateRoughness(renderer, actorsData, floorPD) {
     prop.setSpecular(0.0);
     const rv = ad.roughness;
     prop.setColor(rv, rv, rv);
-    if (ad.roughnessTex) actor.addTexture(ad.roughnessTex);
+    // roughnessTex is the composite (roughness/white RGB + opacity alpha) when
+    // the fabric has an opacity map, so the alpha shader can read texture1.a.
+    const opTex = ad.hasOpacity ? (ad.roughnessTex || ad.opacityTex) : ad.roughnessTex;
+    if (opTex) actor.addTexture(opTex);
+    if (ad.hasOpacity && opTex) {
+      setShaderReplacements(mapper, OPACITY_ALPHA_SHADER);
+      actor.setForceTranslucent(true);
+    }
     renderer.addActor(actor);
   }
   return addFloorActor(renderer, floorPD, [0.5, 0.5, 0.5], null);

@@ -24,6 +24,7 @@ from utils.utils_render_vtk import (
     build_scene_actors,
     populate_gbuffer_renderer,
     enable_translucency,
+    _opacity_texture_for,
     _setup_camera,
 )
 
@@ -99,6 +100,14 @@ void main()
 }
 """
 
+# Depth variant that discards opacity-map holes (bound as "opacityTex") so the
+# gap reveals the depth of whatever is behind the fabric, not the fabric itself.
+DEPTH_FRAG_OPACITY = DEPTH_FRAG.replace(
+    "  float d = 1.0 - gl_FragCoord.z;",
+    "  if (texture(opacityTex, tcoordVCVSOutput).r < 0.5) discard;\n"
+    "  float d = 1.0 - gl_FragCoord.z;",
+)
+
 # (gbuffer_type, viewport_xmin_ymin_xmax_ymax, label)
 PANELS = [
     ("basecolor", (0.0, 0.5, 0.5, 1.0), "Basecolor"),
@@ -125,18 +134,27 @@ def _build_renderer(gbuffer_type, actors_data, scene, tex_cache):
 
     if gbuffer_type == "depth":
         # Interactive depth uses a per-fragment NDC-depth shader (the offscreen
-        # G-buffer renderer captures the real z-buffer instead).
+        # G-buffer renderer captures the real z-buffer instead). Opacity-mapped
+        # fabrics discard their holes so the depth behind shows through.
         ren.SetBackground(0.0, 0.0, 0.0)
-        sp = vtk.vtkShaderProperty()
-        sp.SetVertexShaderCode(DEPTH_VERT)
-        sp.SetFragmentShaderCode(DEPTH_FRAG)
+        depth_sp = vtk.vtkShaderProperty()
+        depth_sp.SetVertexShaderCode(DEPTH_VERT)
+        depth_sp.SetFragmentShaderCode(DEPTH_FRAG)
+        depth_op_sp = vtk.vtkShaderProperty()
+        depth_op_sp.SetVertexShaderCode(DEPTH_VERT)
+        depth_op_sp.SetFragmentShaderCode(DEPTH_FRAG_OPACITY)
         for ad in actors_data:
             mapper = vtk.vtkPolyDataMapper()
             mapper.SetInputData(ad["polydata"])
             mapper.SetScalarVisibility(False)
             actor = vtk.vtkActor()
             actor.SetMapper(mapper)
-            actor.SetShaderProperty(sp)
+            op_tex = _opacity_texture_for(ad, scene, tex_cache)
+            if op_tex:
+                actor.GetProperty().SetTexture("opacityTex", op_tex)
+                actor.SetShaderProperty(depth_op_sp)
+            else:
+                actor.SetShaderProperty(depth_sp)
             ren.AddActor(actor)
         return ren
 

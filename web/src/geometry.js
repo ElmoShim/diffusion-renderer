@@ -2,6 +2,7 @@ import '@kitware/vtk.js/Rendering/Profiles/Geometry';
 import vtkPolyData from '@kitware/vtk.js/Common/DataModel/PolyData';
 import vtkDataArray from '@kitware/vtk.js/Common/Core/DataArray';
 import vtkTexture from '@kitware/vtk.js/Rendering/Core/Texture';
+import vtkImageData from '@kitware/vtk.js/Common/DataModel/ImageData';
 import vtkPolyDataNormals from '@kitware/vtk.js/Filters/Core/PolyDataNormals';
 
 function isIdentity(m) {
@@ -71,154 +72,37 @@ export function makePolyData(positions, indices, vertexCount, triangleCount, nor
   return normalsFilter.getOutputData();
 }
 
-// ── Image DPI parsing ─────────────────────────────────────────────────────
+// ── Texture tile size ─────────────────────────────────────────────────────
 
-function _u16be(b, i) { return ((b[i] & 0xFF) << 8) | (b[i + 1] & 0xFF); }
-function _u32be(b, i) {
-  return (((b[i] & 0xFF) << 24) | ((b[i+1] & 0xFF) << 16) |
-          ((b[i+2] & 0xFF) << 8)  |  (b[i+3] & 0xFF)) >>> 0;
-}
-
-// Parse JPEG or PNG raw bytes → { widthPx, heightPx, dpiX, dpiY }.
-// Defaults to 72 DPI when metadata is absent.
-function parseImageMeta(raw) {
-  const b = new Uint8Array(raw.length);
-  for (let j = 0; j < raw.length; j++) b[j] = raw[j];
-
-  // ── JPEG ──────────────────────────────────────────────────────────────
-  if (b[0] === 0xFF && b[1] === 0xD8) {
-    let w = 0, h = 0, dpiX = 72, dpiY = 72;
-    let i = 2;
-    while (i + 3 < b.length) {
-      if (b[i] !== 0xFF) break;
-      while (i < b.length && b[i] === 0xFF) i++; // skip fill bytes
-      const m = b[i++];
-      if (m === 0xD9 || m === 0xDA) break;
-      const segLen = _u16be(b, i);
-      const d = i + 2; // segment data start
-
-      if (m === 0xE0 && b[d] === 0x4A && b[d + 1] === 0x46) {
-        // JFIF APP0: d+7=units, d+8..9=Xdensity, d+10..11=Ydensity
-        const units = b[d + 7];
-        const xd = _u16be(b, d + 8), yd = _u16be(b, d + 10);
-        if (xd > 0 && yd > 0) {
-          dpiX = units === 1 ? xd : units === 2 ? xd * 2.54 : dpiX;
-          dpiY = units === 1 ? yd : units === 2 ? yd * 2.54 : dpiY;
-        }
-      } else if (m === 0xE1 && b[d] === 0x45 && b[d + 1] === 0x78) {
-        // Exif APP1 — minimal TIFF IFD reader for XResolution/YResolution
-        const t = d + 6; // TIFF header base (after "Exif\0\0")
-        const le = b[t] === 0x49; // 'I' = Intel/little-endian
-        const rd16 = le
-          ? (o) => (b[t + o] & 0xFF) | ((b[t + o + 1] & 0xFF) << 8)
-          : (o) => _u16be(b, t + o);
-        const rd32 = le
-          ? (o) => (((b[t+o] & 0xFF) | ((b[t+o+1] & 0xFF) << 8) |
-                      ((b[t+o+2] & 0xFF) << 16) | ((b[t+o+3] & 0xFF) << 24)) >>> 0)
-          : (o) => _u32be(b, t + o);
-        const rational = (o) => { const n = rd32(o), den = rd32(o + 4); return den ? n / den : 0; };
-        try {
-          const ifdOff = rd32(4);
-          const cnt = rd16(ifdOff);
-          let xr = 0, yr = 0, unit = 2;
-          for (let e = 0; e < cnt; e++) {
-            const ep = ifdOff + 2 + e * 12;
-            const tag = rd16(ep);
-            if (tag === 0x011A) xr = rational(rd32(ep + 8));
-            else if (tag === 0x011B) yr = rational(rd32(ep + 8));
-            else if (tag === 0x0128) unit = rd16(ep + 8);
-          }
-          if (xr > 0 && yr > 0 && dpiX === 72 && dpiY === 72) {
-            dpiX = unit === 3 ? xr * 2.54 : xr;
-            dpiY = unit === 3 ? yr * 2.54 : yr;
-          }
-        } catch { /* ignore malformed Exif */ }
-      } else if (m >= 0xC0 && m <= 0xCF && m !== 0xC4 && m !== 0xC8 && m !== 0xCC) {
-        // SOF marker → image dimensions
-        h = _u16be(b, d + 1);
-        w = _u16be(b, d + 3);
+// Displayed texture tile size { tw, th } in mm — the "width"/"height" from
+// CLO's Fabric panel transformation, exposed per-texture as physicalWidth/
+// physicalHeight (zprj-loader >= 1.2). Reproduces CLO's on-garment scale at any
+// zoom. mat.tileWidth/tileHeight is the bolt width (~1117.6 mm), NOT this value.
+function textureTileMm(mat) {
+  if (mat) {
+    for (const xf of [mat.diffuseTextureTransform, mat.normalTextureTransform]) {
+      if (xf && xf.physicalWidth > 0 && xf.physicalHeight > 0) {
+        return { tw: xf.physicalWidth, th: xf.physicalHeight };
       }
-      i += segLen;
     }
-    return { widthPx: w, heightPx: h, dpiX, dpiY };
   }
-
-  // ── PNG ───────────────────────────────────────────────────────────────
-  if (b[0] === 0x89 && b[1] === 0x50) {
-    const w = _u32be(b, 16), h = _u32be(b, 20);
-    let dpiX = 72, dpiY = 72;
-    let ci = 8;
-    while (ci + 12 < b.length) {
-      const cLen = _u32be(b, ci);
-      const cType = String.fromCharCode(b[ci+4], b[ci+5], b[ci+6], b[ci+7]);
-      if (cType === 'pHYs' && cLen >= 9) {
-        const ppuX = _u32be(b, ci + 8), ppuY = _u32be(b, ci + 12);
-        if (b[ci + 16] === 1 && ppuX > 0 && ppuY > 0) { // unit = metre
-          dpiX = ppuX / 39.3701;
-          dpiY = ppuY / 39.3701;
-        }
-      }
-      if (cType === 'IDAT' || cType === 'IEND') break;
-      ci += 12 + cLen;
-    }
-    return { widthPx: w, heightPx: h, dpiX, dpiY };
-  }
-
-  return { widthPx: 0, heightPx: 0, dpiX: 72, dpiY: 72 };
-}
-
-// Return { tw, th } tile size in mm derived from image DPI (matches CLO's rule).
-// Falls back to mat.tileWidth / mat.tileHeight when the image is unavailable.
-function getTextureTileMm(scene, texPath, mat, cache) {
-  const fallback = {
+  return {
     tw: mat && mat.tileWidth > 0 ? mat.tileWidth : 1,
     th: mat && mat.tileHeight > 0 ? mat.tileHeight : 1,
   };
-  if (!texPath) return fallback;
-  if (cache && cache.has(texPath)) return cache.get(texPath);
-
-  try {
-    if (!scene.hasFile(texPath)) {
-      if (cache) cache.set(texPath, fallback);
-      return fallback;
-    }
-    const raw = scene.readFile(texPath);
-    if (!raw || raw.length === 0) {
-      if (cache) cache.set(texPath, fallback);
-      return fallback;
-    }
-    const { widthPx, heightPx, dpiX, dpiY } = parseImageMeta(raw);
-    if (widthPx > 0 && heightPx > 0 && dpiX > 0 && dpiY > 0) {
-      const result = { tw: (widthPx / dpiX) * 25.4, th: (heightPx / dpiY) * 25.4 };
-      if (cache) cache.set(texPath, result);
-      return result;
-    }
-  } catch { /* fall through */ }
-
-  if (cache) cache.set(texPath, fallback);
-  return fallback;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 
 export function setTexCoords(polyData, uvs, vertexCount, tileWidth, tileHeight, texTransform) {
+  // Pattern UVs are in mm; dividing by the displayed tile size in mm yields
+  // texture repeats (one tile spans tileWidth mm of fabric), matching CLO.
   const tw = tileWidth > 0 ? tileWidth : 1;
   const th = tileHeight > 0 ? tileHeight : 1;
   const scaled = new Float32Array(vertexCount * 2);
   for (let i = 0; i < vertexCount; i++) {
     scaled[i * 2] = uvs[i * 2] / tw;
     scaled[i * 2 + 1] = uvs[i * 2 + 1] / th;
-  }
-  // scaleU/V encodes the user's texture zoom; 0.001 == 100% (CLO default).
-  const SCALE_ONE = 0.001;
-  const su = texTransform?.scaleU ?? SCALE_ONE;
-  const sv = texTransform?.scaleV ?? SCALE_ONE;
-  if (Math.abs(su - SCALE_ONE) > 1e-7 || Math.abs(sv - SCALE_ONE) > 1e-7) {
-    const fu = su / SCALE_ONE, fv = sv / SCALE_ONE;
-    for (let i = 0; i < vertexCount; i++) {
-      scaled[i * 2] *= fu;
-      scaled[i * 2 + 1] *= fv;
-    }
   }
   const angle = texTransform?.rotation ?? 0;
   if (angle) {
@@ -230,12 +114,13 @@ export function setTexCoords(polyData, uvs, vertexCount, tileWidth, tileHeight, 
       scaled[i * 2 + 1] = u * s + v * c;
     }
   }
+  // Texture position offset (mm) → tile units (consistent with the scale above).
   const ou = texTransform?.offsetU ?? 0;
   const ov = texTransform?.offsetV ?? 0;
   if (ou || ov) {
     for (let i = 0; i < vertexCount; i++) {
-      scaled[i * 2] += ou;
-      scaled[i * 2 + 1] += ov;
+      scaled[i * 2] += ou / tw;
+      scaled[i * 2 + 1] += ov / th;
     }
   }
   const tcoords = vtkDataArray.newInstance({
@@ -246,38 +131,95 @@ export function setTexCoords(polyData, uvs, vertexCount, tileWidth, tileHeight, 
   polyData.getPointData().setTCoords(tcoords);
 }
 
+async function loadImageFromScene(scene, texturePath) {
+  if (!texturePath || !scene.hasFile(texturePath)) return null;
+  const raw = scene.readFile(texturePath);
+  if (!raw || raw.length === 0) return null;
+  const bytes = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) bytes[i] = raw[i];
+  const ext = texturePath.split('.').pop()?.toLowerCase() || '';
+  const mime = ext === 'png' ? 'image/png' : 'image/jpeg';
+  const url = URL.createObjectURL(new Blob([bytes], { type: mime }));
+  return new Promise((resolve) => {
+    const el = new Image();
+    el.onload = () => resolve(el);
+    el.onerror = () => resolve(null);
+    el.src = url;
+  });
+}
+
+function makeTexture(imageOrCanvas) {
+  // resizable:true forces the mutable texImage2D path instead of
+  // texStorage2D(levels=1); only then does generateMipmap actually run
+  // (WebGL2 makes texStorage textures immutable at 1 mip level → no mipmaps).
+  const texture = vtkTexture.newInstance({ resizable: true });
+  texture.setImage(imageOrCanvas);
+  texture.setRepeat(true);
+  texture.setInterpolate(true); // interpolate=true triggers mipmap generation
+  return texture;
+}
+
 export async function loadTextureFromScene(scene, texturePath) {
-  try {
-    if (!texturePath || !scene.hasFile(texturePath)) return null;
-    const raw = scene.readFile(texturePath);
-    if (!raw || raw.length === 0) return null;
+  const img = await loadImageFromScene(scene, texturePath);
+  return img ? makeTexture(img) : null;
+}
 
-    const bytes = new Uint8Array(raw.length);
-    for (let i = 0; i < raw.length; i++) bytes[i] = raw[i];
+// Build an RGBA vtkTexture whose alpha is the material's opacity map, so VTK.js
+// (which does `opacity *= texture1.a` for a 4-channel first texture) renders
+// knit gaps / lace / mesh translucently. RGB comes from `colorPath` (e.g. the
+// diffuse map) or solid white when null, so a uniform actor color still shows
+// through. Returns null when neither a color map nor an opacity map exists.
+//   opacity_channel: 0 = luminance of the opacity image, 1 = its alpha channel.
+export async function loadOpacityComposite(scene, colorPath, mat) {
+  const opPath = mat?.opacityTexturePath || null;
+  const colorImg = colorPath ? await loadImageFromScene(scene, colorPath) : null;
+  const opImg = opPath ? await loadImageFromScene(scene, opPath) : null;
+  if (!colorImg && !opImg) return null;
 
-    const ext = texturePath.split('.').pop()?.toLowerCase() || '';
-    const mime = ext === 'png' ? 'image/png' : 'image/jpeg';
-    const blob = new Blob([bytes], { type: mime });
-    const url = URL.createObjectURL(blob);
-
-    const img = await new Promise((resolve, reject) => {
-      const el = new Image();
-      el.onload = () => resolve(el);
-      el.onerror = () => reject(new Error(`Failed to decode texture: ${texturePath}`));
-      el.src = url;
-    });
-
-    // resizable:true forces the mutable texImage2D path instead of
-    // texStorage2D(levels=1); only then does generateMipmap actually run
-    // (WebGL2 makes texStorage textures immutable at 1 mip level → no mipmaps).
-    const texture = vtkTexture.newInstance({ resizable: true });
-    texture.setImage(img);
-    texture.setRepeat(true);
-    texture.setInterpolate(true); // interpolate=true triggers mipmap generation
-    return texture;
-  } catch {
-    return null;
+  const src = colorImg || opImg;
+  const w = src.naturalWidth, h = src.naturalHeight;
+  const cv = document.createElement('canvas');
+  cv.width = w; cv.height = h;
+  const ctx = cv.getContext('2d');
+  if (colorImg) {
+    ctx.drawImage(colorImg, 0, 0, w, h);
+  } else {
+    ctx.fillStyle = '#ffffff';  // white → preserves a uniform actor color
+    ctx.fillRect(0, 0, w, h);
   }
+  const id = ctx.getImageData(0, 0, w, h);
+
+  if (opImg) {
+    const oc = document.createElement('canvas');
+    oc.width = w; oc.height = h;
+    const octx = oc.getContext('2d');
+    octx.drawImage(opImg, 0, 0, w, h);
+    const od = octx.getImageData(0, 0, w, h).data;
+    const useAlpha = mat?.opacityChannel === 1;
+    for (let i = 0; i < w * h; i++) {
+      id.data[i * 4 + 3] = useAlpha
+        ? od[i * 4 + 3]
+        : (od[i * 4] * 0.299 + od[i * 4 + 1] * 0.587 + od[i * 4 + 2] * 0.114);
+    }
+  }
+  // Upload the RGBA pixels directly via vtkImageData. setImage(canvas) drops the
+  // alpha channel on GPU upload (texture renders opaque); setInputData preserves
+  // it. Flip Y to match VTK's bottom-up texture origin.
+  const flipped = new Uint8Array(w * h * 4);
+  for (let y = 0; y < h; y++) {
+    const src = (h - 1 - y) * w * 4;
+    flipped.set(id.data.subarray(src, src + w * 4), y * w * 4);
+  }
+  const imageData = vtkImageData.newInstance();
+  imageData.setDimensions(w, h, 1);
+  imageData.getPointData().setScalars(vtkDataArray.newInstance({
+    numberOfComponents: 4, values: flipped, name: 'rgba',
+  }));
+  const texture = vtkTexture.newInstance({ resizable: true });
+  texture.setInputData(imageData);
+  texture.setRepeat(true);
+  texture.setInterpolate(true);
+  return texture;
 }
 
 // Material resolution (matching Python utils_render_vtk.py logic)
@@ -316,7 +258,6 @@ function normalizeColor(c) {
 export async function buildSceneActors(scene) {
   const actors = [];
   const texCache = new Map();
-  const tileMmCache = new Map();
   const cwIdx = scene.activeColorwayIndex;
 
   // Garment patterns
@@ -333,28 +274,41 @@ export async function buildSceneActors(scene) {
     const mat = getPatternMaterial(scene, i);
     let diffuseTex = null;
     let roughnessTex = null;
+    let opacityTex = null;
+    const hasOpacity = !!(mat && mat.opacityTexturePath);
 
     if (mat && pattern.uvVertexCount === pattern.vertexCount) {
-      const texPath = mat.diffuseTexturePath || null;
-      if (texPath) {
-        if (!texCache.has(texPath)) {
-          texCache.set(texPath, await loadTextureFromScene(scene, texPath));
-        }
-        diffuseTex = texCache.get(texPath);
-      }
-
+      const diffusePath = mat.diffuseTexturePath || null;
       const roughPath = mat.roughnessTexturePath || null;
-      if (roughPath) {
-        const rKey = 'rough:' + roughPath;
-        if (!texCache.has(rKey)) {
-          texCache.set(rKey, await loadTextureFromScene(scene, roughPath));
-        }
+
+      if (hasOpacity) {
+        // Merge the opacity map into the alpha of each color texture so VTK.js
+        // renders knit gaps translucently (opacity *= texture1.a). The white-RGB
+        // composite is reused by the normal/depth shaders via `opacity`.
+        const dKey = `diff+op:${diffusePath}`;
+        if (!texCache.has(dKey)) texCache.set(dKey, await loadOpacityComposite(scene, diffusePath, mat));
+        diffuseTex = texCache.get(dKey);
+        const rKey = `rough+op:${roughPath}`;
+        if (!texCache.has(rKey)) texCache.set(rKey, await loadOpacityComposite(scene, roughPath, mat));
         roughnessTex = texCache.get(rKey);
+        const oKey = 'op:white';
+        if (!texCache.has(oKey)) texCache.set(oKey, await loadOpacityComposite(scene, null, mat));
+        opacityTex = texCache.get(oKey);
+      } else {
+        if (diffusePath) {
+          if (!texCache.has(diffusePath)) texCache.set(diffusePath, await loadTextureFromScene(scene, diffusePath));
+          diffuseTex = texCache.get(diffusePath);
+        }
+        if (roughPath) {
+          const rKey = 'rough:' + roughPath;
+          if (!texCache.has(rKey)) texCache.set(rKey, await loadTextureFromScene(scene, roughPath));
+          roughnessTex = texCache.get(rKey);
+        }
       }
 
-      if (diffuseTex || roughnessTex) {
+      if (diffuseTex || roughnessTex || opacityTex) {
         const uvs = pattern.getUVs();
-        const { tw, th } = getTextureTileMm(scene, mat.diffuseTexturePath, mat, tileMmCache);
+        const { tw, th } = textureTileMm(mat);
         setTexCoords(polyData, uvs, pattern.vertexCount, tw, th, mat.diffuseTextureTransform);
       }
     }
@@ -365,7 +319,7 @@ export async function buildSceneActors(scene) {
     const metallic = isPBR ? (mat.metalness ?? 0.0) : 0.0;
     actors.push({
       polyData, diffuseColor: baseColor, roughness, metallic,
-      diffuseTex, roughnessTex, type: 'garment',
+      diffuseTex, roughnessTex, opacityTex, hasOpacity, type: 'garment',
     });
   }
 
