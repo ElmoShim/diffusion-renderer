@@ -38,23 +38,49 @@ _save_lock = threading.Lock()
 _render_lock = threading.Lock()
 _forward_render = None
 
-# SSE progress broadcast: list of active subscriber queues
-_progress_subscribers: list[queue.Queue] = []
-_progress_lock = threading.Lock()
+# SSE progress: per-job subscriber queues + global render queue state
+# _job_subscribers: {job_id: [Queue, ...]}
+# _render_queue: [job_id, ...] — ordered list of jobs waiting or running
+_job_subscribers: dict[str, list[queue.Queue]] = {}
+_render_queue: list[str] = []   # index 0 = currently running
+_sse_lock = threading.Lock()
 
 
-def _broadcast_progress(event: dict):
-    """Send a progress event to all active SSE subscribers."""
+def _send_to_job(job_id: str, event: dict):
+    """Send an event to all SSE subscribers of a specific job."""
     data = "data: " + json.dumps(event) + "\n\n"
-    with _progress_lock:
+    with _sse_lock:
         dead = []
-        for q in _progress_subscribers:
+        for q in _job_subscribers.get(job_id, []):
             try:
                 q.put_nowait(data)
             except queue.Full:
                 dead.append(q)
         for q in dead:
-            _progress_subscribers.remove(q)
+            _job_subscribers[job_id].remove(q)
+
+
+def _enqueue_job(job_id: str):
+    """Register a new job and notify its subscribers of queue position."""
+    with _sse_lock:
+        _render_queue.append(job_id)
+        pos = len(_render_queue) - 1  # 0 = running, 1+ = waiting
+    if pos > 0:
+        _send_to_job(job_id, {"phase": "queued", "position": pos})
+
+
+def _start_job(job_id: str):
+    """Mark job as started (it's at front of queue)."""
+    _send_to_job(job_id, {"phase": "start", "step": 0, "total": 0})
+
+
+def _finish_job(job_id: str):
+    """Remove job from queue."""
+    with _sse_lock:
+        try:
+            _render_queue.remove(job_id)
+        except ValueError:
+            pass
 
 
 def _resolve_hdr_path(name):
@@ -145,7 +171,7 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_GET(self):
         # SSE progress stream
-        if self.path == "/progress":
+        if self.path == "/progress" or self.path.startswith("/progress?"):
             return self._handle_progress_sse()
 
         # List background presets (subdirs of asset/inverse that have rgb_input.png)
@@ -185,10 +211,23 @@ class Handler(SimpleHTTPRequestHandler):
         return super().do_GET()
 
     def _handle_progress_sse(self):
-        """Long-lived SSE endpoint for render progress events."""
+        """Long-lived SSE endpoint scoped to a single job_id."""
+        from urllib.parse import urlparse, parse_qs
+        qs = parse_qs(urlparse(self.path).query)
+        job_id = (qs.get("job_id") or [None])[0]
+        if not job_id:
+            self._send_text(400, "Missing job_id")
+            return
+
         q = queue.Queue(maxsize=128)
-        with _progress_lock:
-            _progress_subscribers.append(q)
+        with _sse_lock:
+            _job_subscribers.setdefault(job_id, []).append(q)
+            # Immediately inform client of current queue position if already enqueued
+            if job_id in _render_queue:
+                pos = _render_queue.index(job_id)
+                if pos > 0:
+                    q.put_nowait("data: " + json.dumps({"phase": "queued", "position": pos}) + "\n\n")
+
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -200,18 +239,22 @@ class Handler(SimpleHTTPRequestHandler):
                     chunk = q.get(timeout=25)
                     self.wfile.write(chunk.encode("utf-8"))
                     self.wfile.flush()
+                    if '"phase": "done"' in chunk:
+                        break
                 except queue.Empty:
-                    # Heartbeat to keep connection alive
                     self.wfile.write(b": keep-alive\n\n")
                     self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             pass
         finally:
-            with _progress_lock:
+            with _sse_lock:
+                subs = _job_subscribers.get(job_id, [])
                 try:
-                    _progress_subscribers.remove(q)
+                    subs.remove(q)
                 except ValueError:
                     pass
+                if not subs:
+                    _job_subscribers.pop(job_id, None)
 
     def do_POST(self):
         if self.path == "/render":
@@ -225,6 +268,7 @@ class Handler(SimpleHTTPRequestHandler):
         if not ctype.startswith("multipart/form-data"):
             self._send_text(400, "Expected multipart/form-data")
             return
+        job_id = ""
         try:
             fs = cgi.FieldStorage(
                 fp=self.rfile, headers=self.headers,
@@ -233,12 +277,17 @@ class Handler(SimpleHTTPRequestHandler):
             hdr_name = fs.getfirst("hdr", "")
             bg_preset = fs.getfirst("bg_preset", "")
             mode = fs.getfirst("mode", "still")
+            job_id = fs.getfirst("job_id", "")
             if mode not in ("still", "rotate_light"):
                 self._send_text(400, f"Unsupported mode: {mode}")
                 return
+            if not job_id:
+                self._send_text(400, "Missing job_id")
+                return
+            _enqueue_job(job_id)
 
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            save_dir = os.path.join(OUTPUT_DIR, timestamp)
+            save_dir = os.path.join(OUTPUT_DIR, f"{timestamp}_{job_id[:8]}")
             os.makedirs(save_dir, exist_ok=True)
 
             # Save raw PNGs (also keep bytes in memory for inference)
@@ -284,9 +333,7 @@ class Handler(SimpleHTTPRequestHandler):
             with open(os.path.join(save_dir, "meta.json"), "w") as f:
                 json.dump(meta, f, indent=2)
 
-            print(f"[/render] inputs saved → {os.path.relpath(save_dir)} ({w}x{h}) mode={mode} hdr={hdr_name!r} drop={drop_conds}")
-            print("[/render] running diffusion forward render...")
-            _broadcast_progress({"phase": "start", "step": 0, "total": 0})
+            print(f"[/render] job={job_id} inputs saved → {os.path.relpath(save_dir)} ({w}x{h}) mode={mode} hdr={hdr_name!r} drop={drop_conds}")
 
             # Run forward render (serialize — GPU is shared)
             forward_render = _get_forward_render()
@@ -295,7 +342,7 @@ class Handler(SimpleHTTPRequestHandler):
                 frames_holder["frames"] = frames
 
             def on_step(sample_idx, num_samples, step, total):
-                _broadcast_progress({
+                _send_to_job(job_id, {
                     "phase": "denoising",
                     "sample": sample_idx + 1,
                     "num_samples": num_samples,
@@ -304,6 +351,8 @@ class Handler(SimpleHTTPRequestHandler):
                 })
 
             with _render_lock:
+                print(f"[/render] job={job_id} started")
+                _start_job(job_id)
                 forward_render(
                     gbuffers, hdr_path, device=Handler.device,
                     rotate_light=(mode == "rotate_light"),
@@ -312,7 +361,8 @@ class Handler(SimpleHTTPRequestHandler):
                     on_step=on_step,
                     drop_conds=drop_conds or None,
                 )
-            _broadcast_progress({"phase": "done"})
+            _send_to_job(job_id, {"phase": "done"})
+            _finish_job(job_id)
 
             frames = frames_holder["frames"]
             if not frames:
@@ -345,6 +395,9 @@ class Handler(SimpleHTTPRequestHandler):
             self.wfile.write(data)
         except Exception as e:
             traceback.print_exc()
+            if job_id:
+                _send_to_job(job_id, {"phase": "error", "message": str(e)})
+                _finish_job(job_id)
             self._send_text(500, f"Render failed: {e}")
 
     def _handle_upload_hdr(self):

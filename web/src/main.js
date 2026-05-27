@@ -604,35 +604,53 @@ function makePendingSVG() {
   return wrap;
 }
 
-function _updatePendingItems(step, total) {
-  const pct = total > 0 ? Math.round((step / total) * 100) : 0;
-  const offset = _CIRC_CIRCUMFERENCE * (1 - pct / 100);
-  for (const arc of document.querySelectorAll('[data-progress-arc]')) {
+function _updateItemProgress(item, phase, step, total, queuePos) {
+  // Find the DOM element for this gallery item
+  const root = document.getElementById('gallery');
+  const idx = gallery.indexOf(item);
+  if (idx < 0 || !root.children[idx]) return;
+  const el = root.children[idx];
+
+  const arc = el.querySelector('[data-progress-arc]');
+  const pctText = el.querySelector('[data-progress-pct]');
+  const label = el.querySelector('[data-progress-label]');
+  if (!arc) return;
+
+  if (phase === 'queued') {
+    arc.setAttribute('stroke-dashoffset', _CIRC_CIRCUMFERENCE);
+    if (pctText) pctText.textContent = '';
+    if (label) label.textContent = `Queue #${queuePos}`;
+    arc.setAttribute('stroke', '#888');
+  } else if (phase === 'start') {
+    arc.setAttribute('stroke', '#c95a2e');
+    arc.setAttribute('stroke-dashoffset', _CIRC_CIRCUMFERENCE);
+    if (pctText) pctText.textContent = '0%';
+    if (label) label.textContent = 'Preparing…';
+  } else if (phase === 'denoising') {
+    const pct = total > 0 ? Math.round((step / total) * 100) : 0;
+    const offset = _CIRC_CIRCUMFERENCE * (1 - pct / 100);
+    arc.setAttribute('stroke', '#c95a2e');
     arc.setAttribute('stroke-dashoffset', offset);
-  }
-  for (const t of document.querySelectorAll('[data-progress-pct]')) {
-    t.textContent = pct + '%';
-  }
-  for (const l of document.querySelectorAll('[data-progress-label]')) {
-    l.textContent = total > 0 ? `Step ${step} / ${total}` : 'Preparing…';
+    if (pctText) pctText.textContent = pct + '%';
+    if (label) label.textContent = `Step ${step} / ${total}`;
   }
 }
 
-let _sseSource = null;
-
-function startProgressSSE() {
-  if (_sseSource) return;
-  _sseSource = new EventSource('/progress');
-  _sseSource.onmessage = (e) => {
+function watchJobProgress(jobId, galleryItem) {
+  const src = new EventSource(`/progress?job_id=${encodeURIComponent(jobId)}`);
+  src.onmessage = (e) => {
     const ev = JSON.parse(e.data);
-    if (ev.phase === 'start') {
-      _updatePendingItems(0, 0);
+    if (ev.phase === 'queued') {
+      _updateItemProgress(galleryItem, 'queued', 0, 0, ev.position);
+    } else if (ev.phase === 'start') {
+      _updateItemProgress(galleryItem, 'start', 0, 0, 0);
     } else if (ev.phase === 'denoising') {
-      _updatePendingItems(ev.step, ev.total);
+      _updateItemProgress(galleryItem, 'denoising', ev.step, ev.total, 0);
+    } else if (ev.phase === 'done' || ev.phase === 'error') {
+      src.close();
     }
-    // 'done' — HTTP response completes and refreshGallery() replaces the pending item
   };
-  _sseSource.onerror = () => {};
+  src.onerror = () => src.close();
 }
 
 async function renderViaServer(panels, mode = 'still') {
@@ -641,6 +659,8 @@ async function renderViaServer(panels, mode = 'still') {
   renderBtn.disabled = true;
   rotateBtn.disabled = true;
 
+  const jobId = ([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g, c =>
+    (c ^ (Math.random() * 16 >> c / 4)).toString(16));
   const item = {
     timestamp: fmtTime(),
     hdr: activeHdr,
@@ -651,9 +671,11 @@ async function renderViaServer(panels, mode = 'still') {
   };
   gallery.unshift(item);
   refreshGallery();
+  watchJobProgress(jobId, item);
 
   try {
     const formData = new FormData();
+    formData.append('job_id', jobId);
     formData.append('hdr', activeHdr);
     formData.append('mode', mode);
     if (activeBgPreset) formData.append('bg_preset', activeBgPreset);
@@ -1055,8 +1077,6 @@ async function main() {
   });
 
   document.getElementById('loading').classList.add('hidden');
-
-  startProgressSSE();
 
   window.addEventListener('resize', () => {
     for (const p of panels) p.grw.resize();
