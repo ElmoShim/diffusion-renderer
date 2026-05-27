@@ -96,6 +96,17 @@ void main()
 }
 """
 
+# Variant of the normal shader that drives the fragment alpha from an opacity
+# map bound as the property texture "opacityTex" (VTK declares the sampler at
+# the //VTK::TMap hook). Rendered translucent with depth peeling so knit gaps /
+# lace / mesh blend toward the background normal — the same soft cutout the
+# basecolor pass gets from its RGBA texture, instead of a hard per-fragment
+# discard (which under-samples fine knit patterns and barely shows).
+NORMAL_FRAG_OPACITY = NORMAL_FRAG.replace(
+    "fragOutput0 = vec4(n * 0.5 + 0.5, 1.0);",
+    "fragOutput0 = vec4(n * 0.5 + 0.5, texture(opacityTex, tcoordVCVSOutput).r);",
+)
+
 _normal_sp = None
 
 def _get_normal_shader_property():
@@ -209,63 +220,128 @@ def _load_vtk_texture_grayscale(scene, texture_path):
     return tex
 
 
-def _image_tile_mm(scene, texture_path, cache=None):
-    """Return (width_mm, height_mm) of one texture tile derived from image DPI.
+def _load_opacity_alpha(scene, material):
+    """Return the material's opacity map as an HxW uint8 array (0=hole, 255=opaque).
 
-    CLO determines the physical texture repeat from the image's embedded DPI
-    metadata: tile_mm = (pixels / dpi) * 25.4.  Falls back to None when the
-    image cannot be read so callers can use tile_width/height instead.
+    opacity_channel selects the source: 0 = luminance of the RGB image,
+    1 = the image's own alpha channel. Returns None when there is no usable
+    opacity map (or the fabric is forced fully opaque).
     """
-    if cache is not None and texture_path in cache:
-        return cache[texture_path]
-
-    data = scene.read_file(texture_path)
+    op_path = getattr(material, "opacity_texture_path", None)
+    if not op_path:
+        return None
+    if getattr(material, "opaque_mode", 0) == 4:  # FULL_OPAQUE
+        return None
+    data = scene.read_file(op_path)
     if not data:
-        data = scene.read_file(os.path.basename(texture_path))
+        data = scene.read_file(os.path.basename(op_path))
     if not data:
         return None
-
     try:
-        img = Image.open(io.BytesIO(data))
-        w_px, h_px = img.size
-        dpi = img.info.get("dpi", (72.0, 72.0))
-        dpi_x = float(dpi[0]) if dpi[0] > 0 else 72.0
-        dpi_y = float(dpi[1]) if dpi[1] > 0 else 72.0
-        result = ((w_px / dpi_x) * 25.4, (h_px / dpi_y) * 25.4)
-        if cache is not None:
-            cache[texture_path] = result
-        return result
+        oimg = Image.open(io.BytesIO(data))
+        if getattr(material, "opacity_channel", 0) == 1 and "A" in oimg.getbands():
+            return np.array(oimg.convert("RGBA"))[:, :, 3]
+        return np.array(oimg.convert("L"))
     except Exception:
         return None
 
 
-def _compute_tcoords(pattern, material, scene=None, tile_cache=None):
+def _load_opacity_texture(scene, material):
+    """Opacity map as a grayscale vtkTexture (R = opacity), mipmapped so the
+    fine knit pattern averages correctly under minification. None if absent."""
+    alpha = _load_opacity_alpha(scene, material)
+    if alpha is None:
+        return None
+    arr = np.ascontiguousarray(np.flipud(np.stack([alpha] * 3, axis=-1)).astype(np.uint8))
+    h, w = alpha.shape
+    vtk_img = vtk.vtkImageData()
+    vtk_img.SetDimensions(w, h, 1)
+    vtk_img.AllocateScalars(vtk.VTK_UNSIGNED_CHAR, 3)
+    vtk_img.GetPointData().SetScalars(numpy_support.numpy_to_vtk(arr.reshape(-1, 3), deep=True))
+    tex = vtk.vtkTexture()
+    tex.SetInputData(vtk_img)
+    tex.SetRepeat(True)
+    tex.SetInterpolate(True)
+    tex.MipmapOn()
+    return tex
+
+
+def _load_fabric_rgba_texture(scene, material):
+    """Diffuse map merged with the opacity map into one RGBA vtkTexture.
+
+    The opacity map feeds the alpha channel so VTK renders knit gaps / lace /
+    mesh translucently (mipmapped, so the fine pattern softens under
+    minification instead of vanishing). Returns (texture, has_alpha) or
+    (None, False) when there is no diffuse map.
+    """
+    path = getattr(material, "diffuse_texture_path", None)
+    if not path:
+        return None, False
+    data = scene.read_file(path)
+    if not data:
+        data = scene.read_file(os.path.basename(path))
+    if not data:
+        return None, False
+    try:
+        rgb = np.array(Image.open(io.BytesIO(data)).convert("RGB"))
+    except Exception:
+        return None, False
+
+    h, w = rgb.shape[:2]
+    alpha = _load_opacity_alpha(scene, material)
+    has_alpha = alpha is not None
+    if has_alpha:
+        if alpha.shape[:2] != (h, w):
+            alpha = np.array(Image.fromarray(alpha).resize((w, h), Image.BILINEAR))
+        arr = np.dstack([rgb, alpha]).astype(np.uint8)
+    else:
+        arr = rgb.astype(np.uint8)
+    ncomp = arr.shape[2]
+
+    arr = np.ascontiguousarray(np.flipud(arr))
+    vtk_img = vtk.vtkImageData()
+    vtk_img.SetDimensions(w, h, 1)
+    vtk_img.AllocateScalars(vtk.VTK_UNSIGNED_CHAR, ncomp)
+    vtk_img.GetPointData().SetScalars(numpy_support.numpy_to_vtk(arr.reshape(-1, ncomp), deep=True))
+    tex = vtk.vtkTexture()
+    tex.SetInputData(vtk_img)
+    tex.SetRepeat(True)
+    tex.SetInterpolate(True)
+    tex.MipmapOn()
+    return tex, has_alpha
+
+
+def _texture_tile_size(material):
+    """Displayed texture tile size (width, height) in mm for a fabric.
+
+    This is the "width"/"height" shown in CLO's Fabric panel transformation
+    group, exposed per-texture as physical_width/physical_height (zprj-loader
+    >= 1.2). It is the real-world size one texture tile occupies and reproduces
+    CLO's on-garment texture scale at ANY zoom.
+
+    material.tile_width/tile_height is NOT this value: it is the fabric bolt
+    width (~1117.6 mm = 44") and would render textures at the wrong scale.
+    """
+    # Prefer the diffuse tile; for solid-color + normal-map fabrics (no diffuse)
+    # fall back to the normal map's tile, then the physical bolt.
+    for xf in (material.diffuse_texture_transform, material.normal_texture_transform):
+        if xf.physical_width > 0 and xf.physical_height > 0:
+            return xf.physical_width, xf.physical_height
+    tw = material.tile_width if material.tile_width > 0 else 1.0
+    th = material.tile_height if material.tile_height > 0 else 1.0
+    return tw, th
+
+
+def _compute_tcoords(pattern, material):
     uvs = np.array(pattern.uvs).reshape(-1, 2).copy()
 
-    # Derive tile size from image DPI (matches CLO's physical-scale computation).
-    # Fall back to tile_width/height only when the image is unavailable.
-    tw = th = None
-    if scene and getattr(material, "diffuse_texture_path", None):
-        tile = _image_tile_mm(scene, material.diffuse_texture_path, tile_cache)
-        if tile:
-            tw, th = tile
-    if tw is None:
-        tw = material.tile_width if material.tile_width > 0 else 1.0
-        th = material.tile_height if material.tile_height > 0 else 1.0
-
+    # Pattern UVs are in mm; dividing by the displayed tile size in mm yields
+    # texture repeats (one tile spans tile_w mm of fabric), matching CLO.
+    tw, th = _texture_tile_size(material)
     uvs[:, 0] /= tw
     uvs[:, 1] /= th
 
     xf = material.diffuse_texture_transform
-    # scale_u/v encodes the user's texture zoom; 0.001 == 100% (CLO default).
-    su = getattr(xf, "scale_u", 0.001)
-    sv = getattr(xf, "scale_v", 0.001)
-    _SCALE_ONE = 0.001
-    if su and abs(su - _SCALE_ONE) > 1e-7:
-        uvs[:, 0] *= su / _SCALE_ONE
-    if sv and abs(sv - _SCALE_ONE) > 1e-7:
-        uvs[:, 1] *= sv / _SCALE_ONE
-
     angle = getattr(xf, "rotation", 0.0)
     if angle:
         r = math.radians(angle)
@@ -273,11 +349,12 @@ def _compute_tcoords(pattern, material, scene=None, tile_cache=None):
         u, v = uvs[:, 0].copy(), uvs[:, 1].copy()
         uvs[:, 0] = u * c - v * s
         uvs[:, 1] = u * s + v * c
+    # Texture position offset (mm) -> tile units (consistent with the scale).
     ou = getattr(xf, "offset_u", 0.0)
     ov = getattr(xf, "offset_v", 0.0)
     if ou or ov:
-        uvs[:, 0] += ou
-        uvs[:, 1] += ov
+        uvs[:, 0] += ou / tw
+        uvs[:, 1] += ov / th
     return uvs
 
 
@@ -347,7 +424,6 @@ def build_scene_actors(scene, background=True):
         polydata, material, has_tcoords, diffuse_color, roughness, metallic, type
     """
     actors_data = []
-    tile_cache = {}
 
     # Garment patterns
     for i, pat in enumerate(scene.garment_patterns):
@@ -364,7 +440,7 @@ def build_scene_actors(scene, background=True):
         mat = _get_pattern_material(scene, i)
         has_tcoords = False
         if mat and pat.uv_vertex_count == nv:
-            tcoords = _compute_tcoords(pat, mat, scene, tile_cache)
+            tcoords = _compute_tcoords(pat, mat)
             tc_arr = numpy_support.numpy_to_vtk(tcoords.astype(np.float32), deep=True)
             tc_arr.SetNumberOfComponents(2)
             pd.GetPointData().SetTCoords(tc_arr)
@@ -559,6 +635,124 @@ def _capture_zbuffer(win):
     return np.flipud(arr.reshape(h, w)).copy()
 
 
+# ── Shared G-buffer actor setup ──────────────────────────────────────
+
+# Canonical background per G-buffer kind (shared by offscreen + interactive).
+GBUFFER_BACKGROUND = {
+    "basecolor": (0.5, 0.5, 0.5),
+    "normal": (0.5, 0.5, 1.0),
+    "roughness": (0.5, 0.5, 0.5),
+    "metallic": (0.0, 0.0, 0.0),
+}
+
+
+def _opacity_texture_for(ad, scene, tex_cache):
+    """Cached grayscale opacity-map texture for an actor, or None."""
+    mat = ad["material"]
+    if not (ad["has_tcoords"] and mat and getattr(mat, "opacity_texture_path", None)):
+        return None
+    key = ("opacity", mat.opacity_texture_path)
+    if key not in tex_cache:
+        tex_cache[key] = _load_opacity_texture(scene, mat)
+    return tex_cache[key]
+
+
+def enable_translucency(ren):
+    """Enable order-independent transparency (depth peeling) so opacity-mapped
+    fabrics blend correctly. The render window must also have
+    SetAlphaBitPlanes(True) and SetMultiSamples(0)."""
+    ren.SetUseDepthPeeling(True)
+    ren.SetMaximumNumberOfPeels(8)
+    ren.SetOcclusionRatio(0.0)
+
+
+def populate_gbuffer_renderer(ren, kind, actors_data, scene, tex_cache):
+    """Add actors to `ren` configured for G-buffer `kind`
+    ('basecolor' | 'normal' | 'roughness' | 'metallic'), and set the renderer's
+    canonical background.
+
+    Shared by the offscreen render_gbuffers passes and the interactive viewer so
+    texture / opacity / shading stay identical between them. Depth is NOT handled
+    here — the offscreen renderer captures the z-buffer and the interactive viewer
+    uses its own depth shader.
+    """
+    if kind in GBUFFER_BACKGROUND:
+        ren.SetBackground(*GBUFFER_BACKGROUND[kind])
+
+    if kind == "normal":
+        normal_sp = vtk.vtkShaderProperty()
+        normal_sp.SetVertexShaderCode(NORMAL_VERT)
+        normal_sp.SetFragmentShaderCode(NORMAL_FRAG)
+        normal_op_sp = vtk.vtkShaderProperty()  # alpha-from-opacity variant
+        normal_op_sp.SetVertexShaderCode(NORMAL_VERT)
+        normal_op_sp.SetFragmentShaderCode(NORMAL_FRAG_OPACITY)
+
+    for ad in actors_data:
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputData(ad["polydata"])
+        actor = vtk.vtkActor()
+        actor.SetMapper(mapper)
+        prop = actor.GetProperty()
+        mat = ad["material"]
+
+        if kind == "basecolor":
+            prop.SetAmbient(1.0)
+            prop.SetDiffuse(0.0)
+            prop.SetSpecular(0.0)
+            prop.SetColor(*ad["diffuse_color"])
+            if ad["has_tcoords"] and mat and getattr(mat, "diffuse_texture_path", None):
+                # Diffuse merged with the opacity map (alpha); translucent so
+                # knit gaps / lace / mesh blend toward the background.
+                key = ("fabric_rgba", mat.diffuse_texture_path, mat.opacity_texture_path)
+                if key not in tex_cache:
+                    tex_cache[key] = _load_fabric_rgba_texture(scene, mat)
+                vtk_tex, has_alpha = tex_cache[key]
+                if vtk_tex:
+                    actor.SetTexture(vtk_tex)
+                    if has_alpha:
+                        actor.ForceTranslucentOn()
+
+        elif kind == "normal":
+            mapper.SetScalarVisibility(False)
+            op_tex = _opacity_texture_for(ad, scene, tex_cache)
+            if op_tex:
+                prop.SetTexture("opacityTex", op_tex)
+                actor.SetShaderProperty(normal_op_sp)
+                actor.ForceTranslucentOn()
+            else:
+                actor.SetShaderProperty(normal_sp)
+
+        elif kind == "roughness":
+            mapper.SetScalarVisibility(False)
+            prop.SetAmbient(1.0)
+            prop.SetDiffuse(0.0)
+            prop.SetSpecular(0.0)
+            rv = ad["roughness"]
+            prop.SetColor(rv, rv, rv)
+            if ad["has_tcoords"] and mat and getattr(mat, "roughness_texture_path", None):
+                key = ("roughness", mat.roughness_texture_path)
+                if key not in tex_cache:
+                    tex_cache[key] = _load_vtk_texture_grayscale(scene, mat.roughness_texture_path)
+                if tex_cache[key]:
+                    actor.SetTexture(tex_cache[key])
+
+        elif kind == "metallic":
+            mapper.SetScalarVisibility(False)
+            prop.SetAmbient(1.0)
+            prop.SetDiffuse(0.0)
+            prop.SetSpecular(0.0)
+            mv = ad["metallic"]
+            prop.SetColor(mv, mv, mv)
+            if ad["has_tcoords"] and mat and getattr(mat, "metalness_texture_path", None):
+                key = ("metallic", mat.metalness_texture_path)
+                if key not in tex_cache:
+                    tex_cache[key] = _load_vtk_texture_grayscale(scene, mat.metalness_texture_path)
+                if tex_cache[key]:
+                    actor.SetTexture(tex_cache[key])
+
+        ren.AddActor(actor)
+
+
 # ── Public API ───────────────────────────────────────────────────────
 
 def render_gbuffers(scene, resolution=512, fov_deg=20.0, azimuth_deg=0.0,
@@ -590,8 +784,15 @@ def render_gbuffers(scene, resolution=512, fov_deg=20.0, azimuth_deg=0.0,
     win = vtk.vtkRenderWindow()
     win.SetSize(res_w, res_h)
     win.SetOffScreenRendering(True)
+    # Order-independent transparency for opacity-mapped fabrics (knit gaps,
+    # lace, mesh). Depth peeling needs an alpha buffer and no MSAA.
+    win.SetAlphaBitPlanes(True)
+    win.SetMultiSamples(0)
 
     ren = vtk.vtkRenderer()
+    ren.SetUseDepthPeeling(True)
+    ren.SetMaximumNumberOfPeels(8)
+    ren.SetOcclusionRatio(0.0)
     win.AddRenderer(ren)
 
     _setup_camera(ren, actors_data, fov_deg, azimuth_deg, aspect)
@@ -602,48 +803,13 @@ def render_gbuffers(scene, resolution=512, fov_deg=20.0, azimuth_deg=0.0,
     def _to_tensor(arr_uint8):
         return torch.from_numpy(arr_uint8.astype(np.float32) / 255.0).to(device)
 
-    # --- Basecolor (texture-mapped, unlit) ---
-    ren.SetBackground(0.5, 0.5, 0.5)
-    ren.RemoveAllViewProps()
-    for ad in actors_data:
-        mapper = vtk.vtkPolyDataMapper()
-        mapper.SetInputData(ad["polydata"])
-        actor = vtk.vtkActor()
-        actor.SetMapper(mapper)
-        prop = actor.GetProperty()
-        prop.SetAmbient(1.0)
-        prop.SetDiffuse(0.0)
-        prop.SetSpecular(0.0)
-        prop.SetColor(*ad["diffuse_color"])
-        mat = ad["material"]
-        if ad["has_tcoords"] and mat and mat.diffuse_texture_path:
-            key = ("diffuse", mat.diffuse_texture_path)
-            if key not in tex_cache:
-                tex_cache[key] = _load_vtk_texture(scene, mat.diffuse_texture_path)
-            vtk_tex = tex_cache[key]
-            if vtk_tex:
-                actor.SetTexture(vtk_tex)
-        ren.AddActor(actor)
-    gb["basecolor"] = _to_tensor(_capture_rgb(win))
+    # --- Basecolor / Normal (shared actor setup) ---
+    for kind in ("basecolor", "normal"):
+        ren.RemoveAllViewProps()
+        populate_gbuffer_renderer(ren, kind, actors_data, scene, tex_cache)
+        gb[kind] = _to_tensor(_capture_rgb(win))
 
-    # --- Normal (custom shader) ---
-    # Background (0.5, 0.5, 1.0) = camera-facing normal in view space
-    ren.SetBackground(0.5, 0.5, 1.0)
-    normal_sp = vtk.vtkShaderProperty()
-    normal_sp.SetVertexShaderCode(NORMAL_VERT)
-    normal_sp.SetFragmentShaderCode(NORMAL_FRAG)
-    ren.RemoveAllViewProps()
-    for ad in actors_data:
-        mapper = vtk.vtkPolyDataMapper()
-        mapper.SetInputData(ad["polydata"])
-        mapper.SetScalarVisibility(False)
-        actor = vtk.vtkActor()
-        actor.SetMapper(mapper)
-        actor.SetShaderProperty(normal_sp)
-        ren.AddActor(actor)
-    gb["normal"] = _to_tensor(_capture_rgb(win))
-
-    # --- Depth (from Z-buffer) ---
+    # --- Depth (from Z-buffer; plain opaque actors, holes don't punch depth) ---
     ren.SetBackground(1, 1, 1)
     ren.RemoveAllViewProps()
     for ad in actors_data:
@@ -664,59 +830,11 @@ def render_gbuffers(scene, resolution=512, fov_deg=20.0, azimuth_deg=0.0,
     depth_rgb = np.stack([depth_norm] * 3, axis=-1).astype(np.float32)
     gb["depth"] = torch.from_numpy(depth_rgb).to(device)
 
-    # --- Roughness (texture or uniform, unlit) ---
-    ren.SetBackground(0.5, 0.5, 0.5)
-    ren.RemoveAllViewProps()
-    for ad in actors_data:
-        mapper = vtk.vtkPolyDataMapper()
-        mapper.SetInputData(ad["polydata"])
-        mapper.SetScalarVisibility(False)
-        actor = vtk.vtkActor()
-        actor.SetMapper(mapper)
-        prop = actor.GetProperty()
-        prop.SetAmbient(1.0)
-        prop.SetDiffuse(0.0)
-        prop.SetSpecular(0.0)
-        rv = ad["roughness"]
-        prop.SetColor(rv, rv, rv)
-        mat = ad["material"]
-        if ad["has_tcoords"] and mat and mat.roughness_texture_path:
-            key = ("roughness", mat.roughness_texture_path)
-            if key not in tex_cache:
-                tex_cache[key] = _load_vtk_texture_grayscale(
-                    scene, mat.roughness_texture_path)
-            vtk_tex = tex_cache[key]
-            if vtk_tex:
-                actor.SetTexture(vtk_tex)
-        ren.AddActor(actor)
-    gb["roughness"] = _to_tensor(_capture_rgb(win))
-
-    # --- Metallic (texture or uniform, unlit) ---
-    ren.SetBackground(0, 0, 0)
-    ren.RemoveAllViewProps()
-    for ad in actors_data:
-        mapper = vtk.vtkPolyDataMapper()
-        mapper.SetInputData(ad["polydata"])
-        mapper.SetScalarVisibility(False)
-        actor = vtk.vtkActor()
-        actor.SetMapper(mapper)
-        prop = actor.GetProperty()
-        prop.SetAmbient(1.0)
-        prop.SetDiffuse(0.0)
-        prop.SetSpecular(0.0)
-        mv = ad["metallic"]
-        prop.SetColor(mv, mv, mv)
-        mat = ad["material"]
-        if ad["has_tcoords"] and mat and mat.metalness_texture_path:
-            key = ("metallic", mat.metalness_texture_path)
-            if key not in tex_cache:
-                tex_cache[key] = _load_vtk_texture_grayscale(
-                    scene, mat.metalness_texture_path)
-            vtk_tex = tex_cache[key]
-            if vtk_tex:
-                actor.SetTexture(vtk_tex)
-        ren.AddActor(actor)
-    gb["metallic"] = _to_tensor(_capture_rgb(win))
+    # --- Roughness / Metallic (shared actor setup) ---
+    for kind in ("roughness", "metallic"):
+        ren.RemoveAllViewProps()
+        populate_gbuffer_renderer(ren, kind, actors_data, scene, tex_cache)
+        gb[kind] = _to_tensor(_capture_rgb(win))
 
     win.Finalize()
     return gb

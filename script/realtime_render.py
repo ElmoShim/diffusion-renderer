@@ -22,11 +22,9 @@ import zprj_loader
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from utils.utils_render_vtk import (
     build_scene_actors,
-    _load_vtk_texture,
-    _load_vtk_texture_grayscale,
+    populate_gbuffer_renderer,
+    enable_translucency,
     _setup_camera,
-    NORMAL_VERT,
-    NORMAL_FRAG,
 )
 
 
@@ -125,42 +123,9 @@ def _add_label(renderer, text):
 def _build_renderer(gbuffer_type, actors_data, scene, tex_cache):
     ren = vtk.vtkRenderer()
 
-    if gbuffer_type == "basecolor":
-        ren.SetBackground(0.5, 0.5, 0.5)
-        for ad in actors_data:
-            mapper = vtk.vtkPolyDataMapper()
-            mapper.SetInputData(ad["polydata"])
-            actor = vtk.vtkActor()
-            actor.SetMapper(mapper)
-            prop = actor.GetProperty()
-            prop.SetAmbient(1.0)
-            prop.SetDiffuse(0.0)
-            prop.SetSpecular(0.0)
-            prop.SetColor(*ad["diffuse_color"])
-            mat = ad["material"]
-            if ad["has_tcoords"] and mat and getattr(mat, "diffuse_texture_path", None):
-                key = ("diffuse", mat.diffuse_texture_path)
-                if key not in tex_cache:
-                    tex_cache[key] = _load_vtk_texture(scene, mat.diffuse_texture_path)
-                if tex_cache[key]:
-                    actor.SetTexture(tex_cache[key])
-            ren.AddActor(actor)
-
-    elif gbuffer_type == "normal":
-        ren.SetBackground(0.5, 0.5, 1.0)
-        sp = vtk.vtkShaderProperty()
-        sp.SetVertexShaderCode(NORMAL_VERT)
-        sp.SetFragmentShaderCode(NORMAL_FRAG)
-        for ad in actors_data:
-            mapper = vtk.vtkPolyDataMapper()
-            mapper.SetInputData(ad["polydata"])
-            mapper.SetScalarVisibility(False)
-            actor = vtk.vtkActor()
-            actor.SetMapper(mapper)
-            actor.SetShaderProperty(sp)
-            ren.AddActor(actor)
-
-    elif gbuffer_type == "depth":
+    if gbuffer_type == "depth":
+        # Interactive depth uses a per-fragment NDC-depth shader (the offscreen
+        # G-buffer renderer captures the real z-buffer instead).
         ren.SetBackground(0.0, 0.0, 0.0)
         sp = vtk.vtkShaderProperty()
         sp.SetVertexShaderCode(DEPTH_VERT)
@@ -173,30 +138,12 @@ def _build_renderer(gbuffer_type, actors_data, scene, tex_cache):
             actor.SetMapper(mapper)
             actor.SetShaderProperty(sp)
             ren.AddActor(actor)
+        return ren
 
-    elif gbuffer_type == "roughness":
-        ren.SetBackground(0.5, 0.5, 0.5)
-        for ad in actors_data:
-            mapper = vtk.vtkPolyDataMapper()
-            mapper.SetInputData(ad["polydata"])
-            mapper.SetScalarVisibility(False)
-            actor = vtk.vtkActor()
-            actor.SetMapper(mapper)
-            prop = actor.GetProperty()
-            prop.SetAmbient(1.0)
-            prop.SetDiffuse(0.0)
-            prop.SetSpecular(0.0)
-            rv = ad["roughness"]
-            prop.SetColor(rv, rv, rv)
-            mat = ad["material"]
-            if ad["has_tcoords"] and mat and getattr(mat, "roughness_texture_path", None):
-                key = ("roughness", mat.roughness_texture_path)
-                if key not in tex_cache:
-                    tex_cache[key] = _load_vtk_texture_grayscale(scene, mat.roughness_texture_path)
-                if tex_cache[key]:
-                    actor.SetTexture(tex_cache[key])
-            ren.AddActor(actor)
-
+    # basecolor / normal / roughness share the offscreen renderer's actor setup
+    # (textures, opacity maps, shaders) so the viewer matches render_gbuffers.
+    populate_gbuffer_renderer(ren, gbuffer_type, actors_data, scene, tex_cache)
+    enable_translucency(ren)
     return ren
 
 
@@ -223,6 +170,9 @@ def main():
     win = vtk.vtkRenderWindow()
     win.SetSize(1280, 960)
     win.SetWindowName(f"G-Buffer Viewer — {Path(args.zprj_file).name}")
+    # Depth peeling (for opacity-mapped fabrics) needs an alpha buffer and no MSAA.
+    win.SetAlphaBitPlanes(True)
+    win.SetMultiSamples(0)
 
     renderers = []
     for gbuf_type, viewport, label_text in PANELS:

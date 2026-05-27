@@ -650,7 +650,7 @@ requires-dist = [
     { name = "torchvision", marker = "sys_platform == 'darwin'", index = "https://download.pytorch.org/whl/cpu" },
     { name = "tqdm", specifier = ">=4.67.3" },
     { name = "vtk", specifier = ">=9.6.0" },
-    { name = "zprj-loader", git = "https://github.com/clo3d/zprj_loader_python.git?rev=v0.2.0" },
+    { name = "zprj-loader", git = "https://github.com/clo3d/zprj_loader_python.git?rev=v1.2.0-rc0" },
 ]
 
 [[package]]
@@ -3610,8 +3610,8 @@ wheels = [
 
 [[package]]
 name = "zprj-loader"
-version = "0.2.0"
-source = { git = "https://github.com/clo3d/zprj_loader_python.git?rev=v0.2.0#0be52d213fe26c6f6c37b9e5c52eae74b53b4865" }
+version = "1.2.0"
+source = { git = "https://github.com/clo3d/zprj_loader_python.git?rev=v1.2.0-rc0#74dd7115fe5de5ca2a37ef680cecd5f8c617b297" }
 dependencies = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },

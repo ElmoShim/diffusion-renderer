@@ -60,4 +60,4 @@ torchaudio = [
 ]
 
 
-zprj-loader = { git = "https://github.com/clo3d/zprj_loader_python.git", rev="v0.2.0"}
+zprj-loader = { git = "https://github.com/clo3d/zprj_loader_python.git", rev="v1.2.0-rc0"}
