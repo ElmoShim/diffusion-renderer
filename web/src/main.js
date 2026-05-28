@@ -2,6 +2,10 @@ import '@kitware/vtk.js/Rendering/Profiles/Geometry';
 import vtkGenericRenderWindow from '@kitware/vtk.js/Rendering/Misc/GenericRenderWindow';
 import vtkActor from '@kitware/vtk.js/Rendering/Core/Actor';
 import vtkMapper from '@kitware/vtk.js/Rendering/Core/Mapper';
+import vtkCellPicker from '@kitware/vtk.js/Rendering/Core/CellPicker';
+import { extend as extendTrackball } from '@kitware/vtk.js/Interaction/Style/InteractorStyleTrackballCamera';
+import macro from '@kitware/vtk.js/macros';
+import { mat4 } from 'gl-matrix';
 
 import {
   buildSceneActors, buildFloorDisc, computeForegroundBounds,
@@ -14,18 +18,13 @@ const BG_PRESETS = []; // populated at runtime from /bg_presets
 const HDR_PRESETS = ['sunny_vondelpark_1k', 'pink_sunrise_1k', 'street_lamp_1k', 'circus_arena_1k'];
 const GBUFFER_NAMES = ['basecolor', 'normal', 'depth', 'roughness'];
 
-// Per-tab session ID for BG uploads — only this tab can see its own uploads.
-// sessionStorage survives reloads but not tab close; a new tab gets a new id.
-const BG_SID = (() => {
-  let s = sessionStorage.getItem('bg_sid');
-  if (!s) {
-    s = (crypto.randomUUID ? crypto.randomUUID()
-                           : ([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g, c =>
-                               (c ^ (Math.random() * 16 >> c / 4)).toString(16)));
-    sessionStorage.setItem('bg_sid', s);
-  }
-  return s;
-})();
+// Per-page-load session ID for BG uploads — only THIS tab AND THIS load can see
+// its own uploads. We deliberately don't persist it (no sessionStorage), so a
+// refresh discards access to previous uploads.
+const BG_SID = crypto.randomUUID
+  ? crypto.randomUUID()
+  : ([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g, c =>
+      (c ^ (Math.random() * 16 >> c / 4)).toString(16));
 const BG_SID_PARAM = `sid=${encodeURIComponent(BG_SID)}`;
 
 let activeBgPreset = null;
@@ -162,7 +161,221 @@ function frameCameras(panels, actorsData, fovDeg = 15) {
     cam.setViewUp(0, 1, 0);
     cam.setViewAngle(fovDeg);
     cam.setClippingRange(Math.max(dist - span, 0.1), dist * 2.5);
+    // Initial rotate/dolly pivot is the zprj center via the focal point. Pan
+    // can drift it; the mesh-aware interactor uses this for re-framing logic.
+    p.zprjCenter = [cx, cy, cz];
   }
+}
+
+// ── Mesh-aware interaction ──────────────────────────────────────────
+// vtkInteractorStyleTrackballActor-style: dragging on a zprj mesh TRANSLATES
+// the actors in world space (camera+focal never move). Dragging on empty/floor
+// orbits the camera around the CURRENT mesh world center (zprjCenter +
+// scenePanOffset). Wheel zooms toward that same dynamic center. No focal
+// snapping → the pan composition is preserved across rotates and zooms.
+//
+// vtk.js publicAPI instances are Object.frozen by newInstance, so we can't
+// monkey-patch handlers on an existing style — we subclass via the extend
+// pattern instead, then swap it in via setInteractorStyle.
+
+// Shared scene-wide translation applied to every panel's zprj actors. We mirror
+// it to all panels so the four G-buffer views stay in lockstep.
+const scenePanOffset = [0, 0, 0];
+let _meshAwarePanels = null;
+
+function setMeshAwareInteractorPanels(panels) {
+  _meshAwarePanels = panels;
+}
+
+function applyScenePanOffset() {
+  if (!_meshAwarePanels) return;
+  for (const p of _meshAwarePanels) {
+    if (!p.zprjActors) continue;
+    for (const a of p.zprjActors) {
+      a.setPosition(scenePanOffset[0], scenePanOffset[1], scenePanOffset[2]);
+    }
+    p.renderWindow.render();
+  }
+}
+
+function currentMeshPivot(panel) {
+  // Visible mesh world center = baked center + how far we've actor-panned it.
+  const c = panel.zprjCenter;
+  return [
+    c[0] + scenePanOffset[0],
+    c[1] + scenePanOffset[1],
+    c[2] + scenePanOffset[2],
+  ];
+}
+
+// Mesh pivot accessible from non-panel contexts (depth shader callback,
+// bounds computation). All panels share the same zprjCenter — pick any.
+function getSceneMeshPivot() {
+  if (!_meshAwarePanels) return null;
+  for (const p of _meshAwarePanels) {
+    if (p.zprjCenter) return currentMeshPivot(p);
+  }
+  return null;
+}
+
+function meshAwareStyleExtend(publicAPI, model, initialValues = {}) {
+  Object.assign(model, initialValues);
+  extendTrackball(publicAPI, model, initialValues);
+  model.classHierarchy.push('vtkMeshAwareInteractorStyle');
+  macro.setGet(publicAPI, model, ['panel', 'picker']);
+
+  const parentHandleLeftButtonPress = publicAPI.handleLeftButtonPress;
+  const parentHandleMousePan = publicAPI.handleMousePan;
+
+  // Press: pick → if mesh, switch from default rotate to actor-pan. Modifier
+  // keys keep vtk.js's defaults so shift+drag etc. still works.
+  publicAPI.handleLeftButtonPress = (callData) => {
+    model._isActorPan = false;
+    parentHandleLeftButtonPress(callData);  // seeds previousPosition + starts rotate
+    if (callData.shiftKey || callData.controlKey || callData.altKey) return;
+    const panel = model.panel;
+    const picker = model.picker;
+    if (!panel || !picker || !panel.zprjActors) return;
+    const renderer = model.getRenderer(callData);
+    const pos = callData.position;
+    picker.pick([pos.x, pos.y, 0], renderer);
+    const hits = picker.getActors() || [];
+    if (hits.some(a => panel.zprjActors.has(a))) {
+      publicAPI.endRotate();
+      publicAPI.startPan();
+      model._isActorPan = true;
+    }
+  };
+
+  // Pan: actor-translate when we picked a mesh; standard camera-pan otherwise
+  // (e.g. shift+drag). Camera+focal don't move on actor-pan, so the rotation
+  // pivot stays stable relative to whatever the user composed.
+  publicAPI.handleMousePan = (renderer, position) => {
+    if (!model._isActorPan) {
+      parentHandleMousePan(renderer, position);
+      return;
+    }
+    if (!model.previousPosition) return;
+    const panel = model.panel;
+    if (!panel || !panel.zprjCenter) return;
+
+    // Compute world delta at the depth of the visible mesh, so the click point
+    // tracks the cursor 1:1 at that depth.
+    const anchor = currentMeshPivot(panel);
+    const anchorDisp = publicAPI.computeWorldToDisplay(renderer, anchor[0], anchor[1], anchor[2]);
+    const focalDepth = anchorDisp[2];
+    const newW = publicAPI.computeDisplayToWorld(renderer, position.x, position.y, focalDepth);
+    const oldW = publicAPI.computeDisplayToWorld(renderer, model.previousPosition.x, model.previousPosition.y, focalDepth);
+
+    scenePanOffset[0] += newW[0] - oldW[0];
+    scenePanOffset[1] += newW[1] - oldW[1];
+    scenePanOffset[2] += newW[2] - oldW[2];
+    applyScenePanOffset();
+  };
+
+  // Rotate around the CURRENT mesh world center. Applies the same rotation to
+  // camera and focal (via vtkCamera.applyTransform) so view direction relative
+  // to the mesh is preserved — the pan composition stays through rotation.
+  publicAPI.handleMouseRotate = (renderer, position) => {
+    if (!model.previousPosition) return;
+    const panel = model.panel;
+    if (!panel || !panel.zprjCenter) return;
+
+    const rwi = model._interactor;
+    const dx = position.x - model.previousPosition.x;
+    const dy = position.y - model.previousPosition.y;
+    const size = rwi.getView().getViewportSize(renderer);
+    let deltaElevation = -0.1, deltaAzimuth = -0.1;
+    if (size[0] && size[1]) {
+      deltaElevation = -20.0 / size[1];
+      deltaAzimuth = -20.0 / size[0];
+    }
+    const azimuthRad = (dx * deltaAzimuth * model.motionFactor * Math.PI) / 180;
+    const elevationRad = (dy * deltaElevation * model.motionFactor * Math.PI) / 180;
+
+    const camera = renderer.getActiveCamera();
+    const viewUp = camera.getViewUp();
+    // vtkCamera.elevation derives its axis as -[vt[0..2]] from the view matrix;
+    // we use the same so rotation matches the default trackball direction.
+    const vt = camera.getViewMatrix();
+    const rightAxis = [-vt[0], -vt[1], -vt[2]];
+
+    const pivot = currentMeshPivot(panel);
+    const M = mat4.create();
+    mat4.translate(M, M, pivot);
+    mat4.rotate(M, M, elevationRad, rightAxis);
+    mat4.rotate(M, M, azimuthRad, viewUp);
+    mat4.translate(M, M, [-pivot[0], -pivot[1], -pivot[2]]);
+
+    camera.applyTransform(M);
+    camera.orthogonalizeViewUp();
+
+    if (model.autoAdjustCameraClippingRange) {
+      renderer.resetCameraClippingRange();
+    }
+    if (rwi.getLightFollowCamera()) {
+      renderer.updateLightsGeometryToFollowCamera();
+    }
+  };
+
+  // Wheel: dolly toward the current mesh center, preserving view direction
+  // (camera and focal move together, so no view re-aiming jump).
+  publicAPI.handleMouseWheel = (callData) => {
+    const renderer = model.getRenderer(callData);
+    const panel = model.panel;
+    if (!panel || !panel.zprjCenter || callData.spinY === 0) return;
+    const factor = 1 - callData.spinY / model.zoomFactor;
+    if (Number.isNaN(factor) || factor <= 0) return;
+
+    const camera = renderer.getActiveCamera();
+    if (camera.getParallelProjection()) {
+      camera.setParallelScale(camera.getParallelScale() / factor);
+    } else {
+      const target = currentMeshPivot(panel);
+      const cp = camera.getPosition();
+      const fp = camera.getFocalPoint();
+      const newCP = [
+        target[0] + (cp[0] - target[0]) / factor,
+        target[1] + (cp[1] - target[1]) / factor,
+        target[2] + (cp[2] - target[2]) / factor,
+      ];
+      const delta = [newCP[0] - cp[0], newCP[1] - cp[1], newCP[2] - cp[2]];
+      camera.setPosition(newCP[0], newCP[1], newCP[2]);
+      camera.setFocalPoint(fp[0] + delta[0], fp[1] + delta[1], fp[2] + delta[2]);
+    }
+    if (model.autoAdjustCameraClippingRange) {
+      renderer.resetCameraClippingRange();
+    }
+  };
+}
+
+const newMeshAwareStyle = macro.newInstance(meshAwareStyleExtend, 'vtkMeshAwareInteractorStyle');
+
+function updatePanelActorSets(panels) {
+  for (const p of panels) {
+    const all = p.renderer.getActors();
+    p.zprjActors = new Set(all.filter(a => a !== p.floorActor));
+  }
+  // Re-apply the persistent actor offset to any freshly-built actors so a
+  // re-population doesn't snap the mesh back to its baked origin.
+  applyScenePanOffset();
+}
+
+function installMeshAwareInteractor(panel) {
+  if (panel._meshAwareInstalled) return;
+  panel._meshAwareInstalled = true;
+  const picker = vtkCellPicker.newInstance();
+  picker.setTolerance(0.005);
+  const style = newMeshAwareStyle();
+  style.setPanel(panel);
+  style.setPicker(picker);
+  panel.grw.getInteractor().setInteractorStyle(style);
+  // Rotate changes the view direction, so the actor's depth extent maps to a
+  // different dimension (avatar thickness → width on a 90° Y turn). Re-fit the
+  // depth slider after each rotate so it covers the new extent.
+  style.onEndRotateEvent(() => {
+    if (_meshAwarePanels) autoFitDepth(_meshAwarePanels);
+  });
 }
 
 // ── Shader configs ──────────────────────────────────────────────────
@@ -352,8 +565,12 @@ function addDepthUniformCallback(mapper) {
       const prog = cellBO.getProgram();
       const cam = ren.getActiveCamera();
       const pos = cam.getPosition();
-      const fp = cam.getFocalPoint();
-      const dx = fp[0] - pos[0], dy = fp[1] - pos[1], dz = fp[2] - pos[2];
+      // Reference depth = camera-to-mesh distance, NOT camera-to-focal: the
+      // actor-aware interactor lets focal drift on zoom/rotate while the mesh
+      // stays put. Anchoring focalDist to the mesh keeps distFromFocal ≈ 0 at
+      // the actor center across all interactions.
+      const pivot = getSceneMeshPivot() || cam.getFocalPoint();
+      const dx = pivot[0] - pos[0], dy = pivot[1] - pos[1], dz = pivot[2] - pos[2];
       const focalDist = Math.sqrt(dx * dx + dy * dy + dz * dz) || 1;
       if (prog.isUniformUsed('u_depthNear')) prog.setUniformf('u_depthNear', depthState.near);
       if (prog.isUniformUsed('u_depthFar')) prog.setUniformf('u_depthFar', depthState.far);
@@ -1028,6 +1245,7 @@ async function buildAndPopulate(scene, panels) {
   panels[3].floorActor = populateRoughness(panels[3].renderer, actorsData, floorPD);
 
   frameCameras(panels, actorsData, activeFov);
+  updatePanelActorSets(panels);
   for (const p of panels) p.renderWindow.render();
 }
 
@@ -1129,17 +1347,21 @@ function computeFocalRelativeZRange(panel, actorsData) {
   if (!actorsData || !actorsData.length) return null;
   const cam = panel.renderer.getActiveCamera();
   const pos = cam.getPosition();
-  const fp = cam.getFocalPoint();
-  const dx = fp[0] - pos[0], dy = fp[1] - pos[1], dz = fp[2] - pos[2];
+  // Use mesh pivot (not camera focal) so the range matches the depth shader's
+  // pivot-based focalDist after actor-pan / rotate / zoom.
+  const pivot = getSceneMeshPivot() || cam.getFocalPoint();
+  const dx = pivot[0] - pos[0], dy = pivot[1] - pos[1], dz = pivot[2] - pos[2];
   const focalDist = Math.sqrt(dx * dx + dy * dy + dz * dz) || 1;
   const vx = dx / focalDist, vy = dy / focalDist, vz = dz / focalDist;
   let zmin = Infinity, zmax = -Infinity;
   for (const ad of actorsData) {
     const b = ad.polyData.getBounds();
     for (let i = 0; i < 8; i++) {
-      const x = (i & 1) ? b[1] : b[0];
-      const y = (i & 2) ? b[3] : b[2];
-      const z = (i & 4) ? b[5] : b[4];
+      // polyData bounds are local; apply the scene-wide actor pan offset
+      // (same one applied via actor.setPosition) to get world bounds.
+      const x = ((i & 1) ? b[1] : b[0]) + scenePanOffset[0];
+      const y = ((i & 2) ? b[3] : b[2]) + scenePanOffset[1];
+      const z = ((i & 4) ? b[5] : b[4]) + scenePanOffset[2];
       const dist = (x - pos[0]) * vx + (y - pos[1]) * vy + (z - pos[2]) * vz;
       if (dist < zmin) zmin = dist;
       if (dist > zmax) zmax = dist;
@@ -1198,6 +1420,8 @@ async function main() {
   await buildAndPopulate(scene, panels);
 
   syncCameras(panels);
+  setMeshAwareInteractorPanels(panels);
+  for (const p of panels) installMeshAwareInteractor(p);
   autoFitDepth(panels);
 
   // Fixed 2x2 grid for the 4 G-buffer panels
