@@ -652,7 +652,7 @@ def _capture_zbuffer(win):
 # Canonical background per G-buffer kind (shared by offscreen + interactive).
 GBUFFER_BACKGROUND = {
     "basecolor": (0.5, 0.5, 0.5),
-    "normal": (0.5, 0.5, 1.0),
+    "normal": (0.5, 0.5, 0.5),
     "roughness": (0.5, 0.5, 0.5),
     "metallic": (0.0, 0.0, 0.0),
 }

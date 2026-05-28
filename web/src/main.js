@@ -1182,7 +1182,7 @@ async function main() {
   setStatus('Initializing renderers...');
   const panels = [
     createPanel(document.getElementById('panel-basecolor'), [0.5, 0.5, 0.5]),
-    createPanel(document.getElementById('panel-normal'), [0.5, 0.5, 1.0]),
+    createPanel(document.getElementById('panel-normal'), [0.5, 0.5, 0.5]),
     createPanel(document.getElementById('panel-depth'), [1, 1, 1]),
     createPanel(document.getElementById('panel-roughness'), [0.5, 0.5, 0.5]),
   ];
