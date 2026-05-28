@@ -28,6 +28,7 @@ from PIL import Image
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 INVERSE_DIR = os.path.join(PROJECT_ROOT, "asset", "inverse")
+INVERSE_UPLOAD_DIR = os.path.join(PROJECT_ROOT, "output", "inverse_uploads")
 HDRI_DIR = os.path.join(PROJECT_ROOT, "examples", "hdri")
 HDRI_UPLOAD_DIR = os.path.join(PROJECT_ROOT, "output", "hdri_uploads")
 OUTPUT_DIR = os.path.join(PROJECT_ROOT, "output", "web_capture")
@@ -37,6 +38,16 @@ DEFAULT_HDR = os.path.join(PROJECT_ROOT, "examples", "hdri", "sunny_vondelpark_1
 _save_lock = threading.Lock()
 _render_lock = threading.Lock()
 _forward_render = None
+_inverse_render = None
+
+
+def _reset_session_state():
+    """Wipe all per-sid upload dirs at server startup. Per-tab sids already
+    isolate uploads between clients within a running server (see _sid_upload_dir);
+    this is belt-and-suspenders so stale upload dirs from prior server runs
+    don't accumulate on disk. Bundled presets in INVERSE_DIR are untouched."""
+    if os.path.isdir(INVERSE_UPLOAD_DIR):
+        shutil.rmtree(INVERSE_UPLOAD_DIR, ignore_errors=True)
 
 # SSE progress: per-job subscriber queues + global render queue state
 # _job_subscribers: {job_id: [Queue, ...]}
@@ -104,6 +115,70 @@ def _get_forward_render():
         _forward_render = forward_render
         print("Diffusion renderer module ready.")
     return _forward_render
+
+
+def _get_inverse_render():
+    """Lazy import inverse_render."""
+    global _inverse_render
+    if _inverse_render is None:
+        print("Loading inverse renderer module (first request)...")
+        from render_inverse import inverse_render
+        _inverse_render = inverse_render
+        print("Inverse renderer module ready.")
+    return _inverse_render
+
+
+def _sanitize_sid(raw):
+    """Validate the per-tab session id sent by the client. Alphanumeric and
+    hyphen only (covers UUIDs and the JS fallback). Returns '' if invalid —
+    a client without a valid sid only sees bundled presets, never uploads."""
+    if not raw:
+        return ""
+    safe = "".join(c for c in raw if c.isalnum() or c == "-")
+    return safe[:64] if safe == raw and 1 <= len(raw) <= 64 else ""
+
+
+def _sid_upload_dir(sid):
+    """Per-sid upload root, or None when sid is empty/invalid."""
+    return os.path.join(INVERSE_UPLOAD_DIR, sid) if sid else None
+
+
+def _list_bg_presets(sid=""):
+    """Bundled presets + uploads that belong to this sid only."""
+    names = []
+    bases = [INVERSE_DIR]
+    sd = _sid_upload_dir(sid)
+    if sd:
+        bases.append(sd)
+    for base in bases:
+        if not os.path.isdir(base):
+            continue
+        for name in sorted(os.listdir(base)):
+            if os.path.isfile(os.path.join(base, name, "rgb_input.png")):
+                if name not in names:
+                    names.append(name)
+    return names
+
+
+def _resolve_inverse_dir(name, sid=""):
+    """Find the directory for an inverse preset (bundled or this-sid upload)."""
+    bases = [INVERSE_DIR]
+    sd = _sid_upload_dir(sid)
+    if sd:
+        bases.append(sd)
+    for base in bases:
+        d = os.path.join(base, name)
+        if os.path.isdir(d):
+            return d
+    return None
+
+
+def _sanitize_preset_name(raw):
+    """Make a safe directory name from a user-supplied basename."""
+    stem = os.path.splitext(os.path.basename(raw or "upload"))[0]
+    safe = "".join(c if (c.isalnum() or c in "-_") else "_" for c in stem)
+    safe = safe.strip("_") or "upload"
+    return safe[:48]
 
 
 def build_web_client(web_dir):
@@ -182,13 +257,11 @@ class Handler(SimpleHTTPRequestHandler):
         if self.path == "/progress" or self.path.startswith("/progress?"):
             return self._handle_progress_sse()
 
-        # List background presets (subdirs of asset/inverse that have rgb_input.png)
-        if self.path == "/bg_presets":
-            presets = []
-            if os.path.isdir(INVERSE_DIR):
-                for name in sorted(os.listdir(INVERSE_DIR)):
-                    if os.path.isfile(os.path.join(INVERSE_DIR, name, "rgb_input.png")):
-                        presets.append(name)
+        # List background presets (bundled + this-sid uploads only)
+        if self.path == "/bg_presets" or self.path.startswith("/bg_presets?"):
+            from urllib.parse import urlparse, parse_qs
+            sid = _sanitize_sid(parse_qs(urlparse(self.path).query).get("sid", [""])[0])
+            presets = _list_bg_presets(sid)
             body = json.dumps(presets).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -197,14 +270,23 @@ class Handler(SimpleHTTPRequestHandler):
             self.wfile.write(body)
             return
 
-        # Serve /inverse/* from asset/inverse/
+        # Serve /inverse/<name>/<file> from bundled asset/inverse/ or this-sid uploads.
+        # A client without a valid sid can only fetch bundled presets.
         if self.path.startswith("/inverse/"):
-            rel = self.path[len("/inverse/"):].split("?")[0]
-            file_path = os.path.normpath(os.path.join(INVERSE_DIR, rel))
-            if not file_path.startswith(INVERSE_DIR):
-                self._send_text(403, "Forbidden")
-                return
-            return self._serve_file(file_path, "image/png")
+            from urllib.parse import urlparse, parse_qs
+            parsed = urlparse(self.path)
+            sid = _sanitize_sid(parse_qs(parsed.query).get("sid", [""])[0])
+            rel = parsed.path[len("/inverse/"):]
+            bases = [INVERSE_DIR]
+            sd = _sid_upload_dir(sid)
+            if sd:
+                bases.append(sd)
+            for base in bases:
+                file_path = os.path.normpath(os.path.join(base, rel))
+                if file_path.startswith(base) and os.path.isfile(file_path):
+                    return self._serve_file(file_path, "image/png")
+            self._send_text(404, "Not found")
+            return
 
         # Serve /hdri/<name>.hdr from examples/hdri/ (or uploads)
         if self.path.startswith("/hdri/"):
@@ -269,6 +351,8 @@ class Handler(SimpleHTTPRequestHandler):
             return self._handle_render()
         if self.path == "/upload_hdr":
             return self._handle_upload_hdr()
+        if self.path == "/upload_bg":
+            return self._handle_upload_bg()
         self._send_text(404, "Not found")
 
     def _handle_render(self):
@@ -408,6 +492,111 @@ class Handler(SimpleHTTPRequestHandler):
                 _finish_job(job_id)
             self._send_text(500, f"Render failed: {e}")
 
+    def _handle_upload_bg(self):
+        """Receive an RGB image, run inverse_render, save G-buffers as a preset
+        under this client's per-tab sid. Only the uploading client sees it."""
+        ctype = self.headers.get("Content-Type", "")
+        if not ctype.startswith("multipart/form-data"):
+            self._send_text(400, "Expected multipart/form-data")
+            return
+        job_id = ""
+        try:
+            fs = cgi.FieldStorage(
+                fp=self.rfile, headers=self.headers,
+                environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": ctype},
+            )
+            if "image" not in fs:
+                self._send_text(400, "Missing 'image' field")
+                return
+            job_id = fs.getfirst("job_id", "")
+            if not job_id:
+                self._send_text(400, "Missing job_id")
+                return
+            sid = _sanitize_sid(fs.getfirst("sid", ""))
+            if not sid:
+                self._send_text(400, "Missing or invalid sid")
+                return
+
+            item = fs["image"]
+            raw = item.file.read()
+            orig_name = os.path.basename(item.filename or "upload.png")
+            preset_name = _sanitize_preset_name(orig_name)
+            existing = set(_list_bg_presets(sid))
+            if preset_name in existing:
+                base = preset_name
+                i = 2
+                while f"{base}_{i}" in existing:
+                    i += 1
+                preset_name = f"{base}_{i}"
+
+            sid_dir = _sid_upload_dir(sid)
+            os.makedirs(sid_dir, exist_ok=True)
+            preset_dir = os.path.join(sid_dir, preset_name)
+            os.makedirs(preset_dir, exist_ok=True)
+
+            src_ext = os.path.splitext(orig_name)[1].lower() or ".png"
+            if src_ext not in (".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".webp"):
+                src_ext = ".png"
+            src_path = os.path.join(preset_dir, f"_source{src_ext}")
+            with open(src_path, "wb") as f:
+                f.write(raw)
+
+            _enqueue_job(job_id)
+
+            print(f"[/upload_bg] sid={sid[:8]} job={job_id[:8]} preset={preset_name} ({len(raw)} bytes)")
+
+            inverse_render = _get_inverse_render()
+
+            def on_pass(pi, np_, name):
+                _send_to_job(job_id, {
+                    "phase": "inverse_pass",
+                    "pass_idx": pi,
+                    "num_passes": np_,
+                    "pass_name": name,
+                })
+
+            def on_step(pi, np_, step, total):
+                _send_to_job(job_id, {
+                    "phase": "denoising",
+                    "sample": pi + 1,
+                    "num_samples": np_,
+                    "step": pi * total + step,
+                    "total": np_ * total,
+                })
+
+            with _render_lock:
+                _start_job(job_id)
+                results = inverse_render(
+                    src_path,
+                    passes=GBUFFER_NAMES,
+                    device=Handler.device,
+                    on_pass=on_pass,
+                    on_step=on_step,
+                )
+
+            for name, frames in results.items():
+                Image.fromarray(frames[0]).save(os.path.join(preset_dir, f"{name}.png"))
+
+            _send_to_job(job_id, {"phase": "done"})
+            _finish_job(job_id)
+
+            print(f"[/upload_bg] preset saved → {os.path.relpath(preset_dir)}")
+            body = json.dumps({
+                "name": preset_name,
+                "passes": list(results.keys()),
+            }).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as e:
+            traceback.print_exc()
+            if job_id:
+                _send_to_job(job_id, {"phase": "error", "message": str(e)})
+                _finish_job(job_id)
+            self._send_text(500, f"Inverse render failed: {e}")
+
     def _handle_upload_hdr(self):
         ctype = self.headers.get("Content-Type", "")
         if not ctype.startswith("multipart/form-data"):
@@ -481,6 +670,8 @@ def main():
 
     print(f"HDR: {Handler.hdr_path}")
     print(f"Inverse asset dir: {INVERSE_DIR}")
+    _reset_session_state()
+    print(f"Cleared all BG upload dirs at startup: {INVERSE_UPLOAD_DIR}")
     server = ThreadingHTTPServer(("0.0.0.0", args.port), Handler)
     print(f"Server running at http://localhost:{args.port}")
     print("Note: diffusion model will load lazily on first /render request.")

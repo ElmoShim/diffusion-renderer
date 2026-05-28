@@ -14,6 +14,20 @@ const BG_PRESETS = []; // populated at runtime from /bg_presets
 const HDR_PRESETS = ['sunny_vondelpark_1k', 'pink_sunrise_1k', 'street_lamp_1k', 'circus_arena_1k'];
 const GBUFFER_NAMES = ['basecolor', 'normal', 'depth', 'roughness'];
 
+// Per-tab session ID for BG uploads — only this tab can see its own uploads.
+// sessionStorage survives reloads but not tab close; a new tab gets a new id.
+const BG_SID = (() => {
+  let s = sessionStorage.getItem('bg_sid');
+  if (!s) {
+    s = (crypto.randomUUID ? crypto.randomUUID()
+                           : ([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g, c =>
+                               (c ^ (Math.random() * 16 >> c / 4)).toString(16)));
+    sessionStorage.setItem('bg_sid', s);
+  }
+  return s;
+})();
+const BG_SID_PARAM = `sid=${encodeURIComponent(BG_SID)}`;
+
 let activeBgPreset = null;
 let activeHdr = HDR_PRESETS[0];
 let currentActorsData = null;
@@ -552,7 +566,7 @@ function setBackgroundPreset(panels, presetName) {
     } else {
       if (img) {
         const buf = img.dataset.buf;
-        img.src = `/inverse/${presetName}/${buf}.png`;
+        img.src = `/inverse/${presetName}/${buf}.png?${BG_SID_PARAM}`;
         img.classList.add('visible');
       }
       // Transparent renderer bg so the <img> behind canvas shows through
@@ -824,6 +838,99 @@ function watchJobProgress(jobId, galleryItem) {
   src.onerror = () => src.close();
 }
 
+// ── BG inverse-render upload ───────────────────────────────────────
+
+function makeBgThumbProgress() {
+  const wrap = document.createElement('div');
+  wrap.className = 'gallery-progress';
+  wrap.style.position = 'absolute';
+  wrap.style.inset = '0';
+  wrap.innerHTML = '';
+  const ns = 'http://www.w3.org/2000/svg';
+  const size = 36, r = 14, sw = 3, c = r + sw;
+  const circ = 2 * Math.PI * r;
+  const svg = document.createElementNS(ns, 'svg');
+  svg.setAttribute('width', size); svg.setAttribute('height', size);
+  svg.setAttribute('viewBox', `0 0 ${size} ${size}`);
+  const track = document.createElementNS(ns, 'circle');
+  track.setAttribute('cx', c); track.setAttribute('cy', c); track.setAttribute('r', r);
+  track.setAttribute('fill', 'none');
+  track.setAttribute('stroke', 'rgba(255,255,255,0.12)');
+  track.setAttribute('stroke-width', sw);
+  svg.appendChild(track);
+  const arc = document.createElementNS(ns, 'circle');
+  arc.setAttribute('cx', c); arc.setAttribute('cy', c); arc.setAttribute('r', r);
+  arc.setAttribute('fill', 'none');
+  arc.setAttribute('stroke', '#c95a2e');
+  arc.setAttribute('stroke-width', sw);
+  arc.setAttribute('stroke-linecap', 'round');
+  arc.setAttribute('stroke-dasharray', circ);
+  arc.setAttribute('stroke-dashoffset', circ);
+  arc.setAttribute('transform', `rotate(-90 ${c} ${c})`);
+  svg.appendChild(arc);
+  wrap.appendChild(svg);
+  return { wrap, arc, circ };
+}
+
+async function uploadBgImage(file, thumbs, addBgThumb, selectBgThumb) {
+  const placeholder = document.createElement('div');
+  placeholder.className = 'bg-thumb pending';
+  placeholder.title = file.name;
+  const prog = makeBgThumbProgress();
+  placeholder.appendChild(prog.wrap);
+  const lab = document.createElement('div');
+  lab.className = 'bg-thumb-label';
+  lab.textContent = 'Queued…';
+  placeholder.appendChild(lab);
+  thumbs.appendChild(placeholder);
+
+  const jobId = ([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g, c =>
+    (c ^ (Math.random() * 16 >> c / 4)).toString(16));
+
+  const src = new EventSource(`/progress?job_id=${encodeURIComponent(jobId)}`);
+  src.onmessage = (e) => {
+    const ev = JSON.parse(e.data);
+    if (ev.phase === 'queued') {
+      lab.textContent = `Queue #${ev.position}`;
+    } else if (ev.phase === 'start') {
+      lab.textContent = 'Preparing…';
+      prog.arc.setAttribute('stroke-dashoffset', prog.circ);
+    } else if (ev.phase === 'inverse_pass') {
+      lab.textContent = `${ev.pass_name} (${ev.pass_idx + 1}/${ev.num_passes})`;
+    } else if (ev.phase === 'denoising') {
+      const pct = ev.total > 0 ? ev.step / ev.total : 0;
+      prog.arc.setAttribute('stroke-dashoffset', prog.circ * (1 - pct));
+    } else if (ev.phase === 'done' || ev.phase === 'error') {
+      src.close();
+    }
+  };
+  src.onerror = () => src.close();
+
+  try {
+    const form = new FormData();
+    form.append('job_id', jobId);
+    form.append('sid', BG_SID);
+    form.append('image', file, file.name);
+    const resp = await fetch('/upload_bg', { method: 'POST', body: form });
+    if (!resp.ok) {
+      const text = await resp.text();
+      throw new Error(`Server error ${resp.status}: ${text}`);
+    }
+    const info = await resp.json();
+    placeholder.remove();
+    const t = addBgThumb(info.name);
+    if (t) selectBgThumb(t);
+  } catch (err) {
+    console.error(err);
+    src.close();
+    lab.textContent = 'Failed';
+    placeholder.classList.remove('pending');
+    placeholder.style.pointerEvents = 'auto';
+    placeholder.addEventListener('click', () => placeholder.remove(), { once: true });
+    alert('BG inverse render failed: ' + err.message);
+  }
+}
+
 async function renderViaServer(panels, mode = 'still') {
   const renderBtn = document.getElementById('render-btn');
   const rotateBtn = document.getElementById('rotate-light-btn');
@@ -854,14 +961,14 @@ async function renderViaServer(panels, mode = 'still') {
       const name = p.bufName;
       const dataUrl = await captureAtTargetSize(p);
       const bgUrl = activeBgPreset
-        ? `/inverse/${activeBgPreset}/${name}.png`
+        ? `/inverse/${activeBgPreset}/${name}.png?${BG_SID_PARAM}`
         : null;
       const blob = await compositeCapture(dataUrl, bgUrl);
       item.gbuffers[name] = URL.createObjectURL(blob);
       formData.append(name, blob, `${name}.png`);
     }
     // Metallic: composite with background if available, else black
-    const metallicBgUrl = activeBgPreset ? `/inverse/${activeBgPreset}/metallic.png` : null;
+    const metallicBgUrl = activeBgPreset ? `/inverse/${activeBgPreset}/metallic.png?${BG_SID_PARAM}` : null;
     const metallicBlob = metallicBgUrl
       ? await compositeCapture(makeBlackDataUrl(RENDER_W, RENDER_H), metallicBgUrl)
       : await makeBlackBlob(RENDER_W, RENDER_H);
@@ -1111,27 +1218,44 @@ async function main() {
   clearThumb.textContent = 'None';
   clearThumb.dataset.preset = '';
   thumbs.appendChild(clearThumb);
+
+  function addBgThumb(preset) {
+    if (BG_PRESETS.includes(preset)) return null;
+    BG_PRESETS.push(preset);
+    const t = document.createElement('div');
+    t.className = 'bg-thumb';
+    t.style.backgroundImage = `url(/inverse/${preset}/rgb_input.png?${BG_SID_PARAM}&t=${Date.now()})`;
+    t.dataset.preset = preset;
+    t.title = preset;
+    thumbs.appendChild(t);
+    return t;
+  }
+
+  function selectBgThumb(el) {
+    for (const sib of thumbs.children) sib.classList.remove('active');
+    el.classList.add('active');
+    setBackgroundPreset(panels, el.dataset.preset || null);
+  }
+
   try {
-    const bgResp = await fetch('/bg_presets');
+    const bgResp = await fetch(`/bg_presets?${BG_SID_PARAM}`);
     const presets = await bgResp.json();
-    BG_PRESETS.push(...presets);
-    for (const preset of presets) {
-      const t = document.createElement('div');
-      t.className = 'bg-thumb';
-      t.style.backgroundImage = `url(/inverse/${preset}/rgb_input.png)`;
-      t.dataset.preset = preset;
-      t.title = preset;
-      thumbs.appendChild(t);
-    }
+    for (const preset of presets) addBgThumb(preset);
   } catch (e) {
     console.warn('Failed to load bg presets', e);
   }
   thumbs.addEventListener('click', (e) => {
     const t = e.target.closest('.bg-thumb');
-    if (!t) return;
-    for (const sib of thumbs.children) sib.classList.remove('active');
-    t.classList.add('active');
-    setBackgroundPreset(panels, t.dataset.preset || null);
+    if (!t || t.classList.contains('pending')) return;
+    selectBgThumb(t);
+  });
+
+  // ── BG image upload → server-side inverse render ──────────────────
+  document.getElementById('bg-file').addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    e.target.value = '';
+    if (!file) return;
+    await uploadBgImage(file, thumbs, addBgThumb, selectBgThumb);
   });
 
   // HDR gallery (sidebar)

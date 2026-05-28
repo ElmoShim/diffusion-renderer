@@ -139,7 +139,8 @@ def _normalize_normal_video(video):
     return normalized * blend + video * (1 - blend)
 
 
-def inverse_render(input_path, passes=None, device="cuda", seed=None):
+def inverse_render(input_path, passes=None, device="cuda", seed=None,
+                   on_pass=None, on_step=None):
     """Run inverse rendering on an image or video.
 
     Args:
@@ -147,6 +148,8 @@ def inverse_render(input_path, passes=None, device="cuda", seed=None):
         passes: list of G-buffer pass names. Defaults to DEFAULT_PASSES.
         device: torch device.
         seed: random seed.
+        on_pass: optional callback(pass_idx, num_passes, pass_name) before each pass.
+        on_step: optional callback(pass_idx, num_passes, step, total) per denoise step.
 
     Returns:
         dict {pass_name: (T, H, W, 3) uint8 numpy array}, plus key "rgb_input"
@@ -166,20 +169,28 @@ def inverse_render(input_path, passes=None, device="cuda", seed=None):
     frames = _load_frames_from_path(input_path, cfg.inference_n_frames, cfg.inference_res)
     data_batch = _build_data_batch(frames, cfg, device=device)
 
+    valid_passes = [p for p in passes if p in GBUFFER_INDEX_MAPPING]
+    num_passes = len(valid_passes)
+
     results = {"rgb_input": frames}
-    for pass_name in passes:
-        if pass_name not in GBUFFER_INDEX_MAPPING:
-            print(f"  Skipping unknown pass: {pass_name}")
-            continue
+    for pass_idx, pass_name in enumerate(valid_passes):
         idx = GBUFFER_INDEX_MAPPING[pass_name]
         data_batch["context_index"] = torch.tensor([idx], dtype=torch.long, device=device)
         print(f"  Estimating {pass_name} (context_index={idx})...")
+        if on_pass is not None:
+            on_pass(pass_idx, num_passes, pass_name)
+
+        step_cb = None
+        if on_step is not None:
+            def step_cb(step, total, _pi=pass_idx, _np=num_passes):
+                on_step(_pi, _np, step, total)
 
         video = model.generate(
             data_batch,
             guidance=cfg.get("guidance", 0.0),
             num_steps=cfg.inference_n_steps,
             seed=seed,
+            on_step=step_cb,
         )
 
         if pass_name == "normal":
