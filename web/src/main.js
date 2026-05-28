@@ -73,8 +73,12 @@ function createPanel(panelEl, bgColor = [0, 0, 0]) {
   const grw = vtkGenericRenderWindow.newInstance({ background: bgColor });
   grw.setContainer(canvasWrap);
   grw.resize();
-  // Order-independent transparency for opacity-mapped fabrics: without it the
-  // sweater's front and back translucent layers blend to near-opaque.
+  // NOTE: the normal/roughness/depth passes render opacity-mapped materials as
+  // opaque alpha-test cutouts (see OPACITY_CUTOFF), NOT translucent — vtk.js has
+  // no depth peeling, only a single-pass weighted-blended OIT that washes out
+  // high-depth-complexity hair. These depth-peeling calls are vtk.js no-ops (kept
+  // harmless). The basecolor pass is the exception: it stays translucent
+  // (forceTranslucent + OIT) so knit gaps blend over the background.
   const renderer = grw.getRenderer();
   renderer.setUseDepthPeeling(true);
   renderer.setMaximumNumberOfPeels(8);
@@ -149,6 +153,15 @@ function frameCameras(panels, actorsData, fovDeg = 15) {
 
 // ── Shader configs ──────────────────────────────────────────────────
 
+// Opacity is handled as an ALPHA-TEST CUTOUT, not translucent blending: vtk.js
+// has no depth peeling, only weighted-blended OIT (a single-pass approximation
+// that under-accumulates opacity for high-depth-complexity geometry like hair —
+// many overlapping sparse-alpha cards stay see-through). Rendering opaque and
+// discarding sub-threshold fragments lets the z-buffer occlude layer-over-layer,
+// so the union of opaque strands fills in dense, matching Python's depth-peeled
+// density. Tune this if hair/knit reads too sparse (lower) or too solid (higher).
+const OPACITY_CUTOFF = 0.25;
+
 // Output the view-space normal as color. Camera looks along -Z, so a
 // front-facing normal has z > 0; flip back-facing ones toward the camera.
 const NORMAL_BODY =
@@ -164,16 +177,14 @@ const NORMAL_SHADER = [
   },
 ];
 
-// Matches the Python normal pass (utils_render_vtk.py populate_gbuffer_renderer):
-// emit the view-space normal as color with the opacity map driving the fragment
-// alpha, rendered translucent with depth peeling. Same flip (NORMAL_BODY: n.z < 0)
-// and same peel settings (8 peels, occlusionRatio 0). Used when the material has
-// an opacity map but NO normal map (otherwise NORMAL_MAP_OPACITY_SHADER applies).
+// Opacity variant with NO normal map: discard opacity-map holes (alpha-test
+// cutout), render the surface opaque. Used for materials that have an opacity
+// map but no normal map (otherwise NORMAL_MAP_OPACITY_SHADER applies).
 const NORMAL_OPACITY_SHADER = [
   {
     shaderType: 'Fragment',
     originalValue: '//VTK::Light::Impl',
-    replacementValue: `${NORMAL_BODY}\n      gl_FragData[0] = vec4(n * 0.5 + 0.5, texture2D(texture1, tcoordVCVSOutput).a);`,
+    replacementValue: `if (texture2D(texture1, tcoordVCVSOutput).a < ${OPACITY_CUTOFF}) discard;\n      ${NORMAL_BODY}\n      gl_FragData[0] = vec4(n * 0.5 + 0.5, 1.0);`,
     replaceFirst: true,
   },
 ];
@@ -212,11 +223,12 @@ const NORMAL_MAP_FS_DEC = {
   replaceFirst: true,
 };
 
-// alphaExpr: GLSL for the output alpha ('1.0' opaque, or 'nmap.a' opacity cutout).
-// Nv (vtk.js's normalized, front-face-flipped view normal) + the per-vertex tangent
-// form the TBN; the tangent-space normal map is decoded (rgb*2-1) and rotated into
-// view space, then flipped toward the camera (n.z < 0) like the geometric pass.
-function normalMapShader(alphaExpr) {
+// cutout: when true, discard opacity-map holes (alpha-test) before shading and
+// render opaque — same cutout the other passes use. Nv (vtk.js's normalized,
+// front-face-flipped view normal) + the per-vertex tangent form the TBN; the
+// tangent-space normal map is decoded (rgb*2-1), rotated into view space, then
+// flipped toward the camera (n.z < 0) like the geometric pass.
+function normalMapShader(cutout) {
   return [
     ...NORMAL_MAP_VS,
     NORMAL_MAP_FS_DEC,
@@ -225,24 +237,38 @@ function normalMapShader(alphaExpr) {
       originalValue: '//VTK::Light::Impl',
       replacementValue: [
         'vec4 nmap = texture2D(texture1, tcoordVCVSOutput);',
+        cutout ? `if (nmap.a < ${OPACITY_CUTOFF}) discard;` : '',
         'vec3 Nv = normalize(normalVCVSOutput);',
         'vec3 Tv = normalize(tangentVCVSOutput - dot(tangentVCVSOutput, Nv) * Nv);',
         'vec3 Bv = cross(Nv, Tv) * tangentWVSOutput;',
         'vec3 nt = nmap.xyz * 2.0 - 1.0;',
         'vec3 nn = normalize(mat3(Tv, Bv, Nv) * nt);',
         'if (nn.z < 0.0) nn = -nn;',
-        `gl_FragData[0] = vec4(nn * 0.5 + 0.5, ${alphaExpr});`,
-      ].join('\n      '),
+        'gl_FragData[0] = vec4(nn * 0.5 + 0.5, 1.0);',
+      ].filter(Boolean).join('\n      '),
       replaceFirst: true,
     },
   ];
 }
 
-const NORMAL_MAP_SHADER = normalMapShader('1.0');
-const NORMAL_MAP_OPACITY_SHADER = normalMapShader('nmap.a');
+const NORMAL_MAP_SHADER = normalMapShader(false);
+const NORMAL_MAP_OPACITY_SHADER = normalMapShader(true);
 
-// For color G-buffers (basecolor/roughness): keep VTK.js's color/lighting, then
-// override the fragment alpha with the opacity map (texture1.a).
+// For the roughness G-buffer: keep VTK.js's color/lighting, then discard
+// opacity-map holes (alpha-test cutout) so the surface renders opaque and the
+// z-buffer occludes overlapping layers (dense hair) instead of OIT washing.
+const OPACITY_DISCARD_SHADER = [
+  {
+    shaderType: 'Fragment',
+    originalValue: '//VTK::Light::Impl',
+    replacementValue: `//VTK::Light::Impl\n      if (texture2D(texture1, tcoordVCVSOutput).a < ${OPACITY_CUTOFF}) discard;`,
+    replaceFirst: true,
+  },
+];
+
+// For the basecolor G-buffer: keep VTK.js's color/lighting, then override the
+// fragment alpha with the opacity map (texture1.a). forceTranslucent + OIT then
+// blend knit gaps over the background (translucent, not alpha-test cutout).
 const OPACITY_ALPHA_SHADER = [
   {
     shaderType: 'Fragment',
@@ -295,7 +321,7 @@ const DEPTH_OPACITY_SHADER = [
     shaderType: 'Fragment',
     originalValue: '//VTK::Light::Impl',
     replacementValue: `
-      if (texture2D(texture1, tcoordVCVSOutput).a < 0.5) discard;
+      if (texture2D(texture1, tcoordVCVSOutput).a < ${OPACITY_CUTOFF}) discard;
       float distFromFocal = (-vertexVCVSOutput.z) - u_focalDist;
       float d = clamp((distFromFocal - u_depthNear) / max(u_depthFar - u_depthNear, 1e-6), 0.0, 1.0);
       gl_FragData[0] = vec4(vec3(d), 1.0);
@@ -355,8 +381,8 @@ function populateBasecolor(renderer, actorsData, floorPD) {
     if (ad.diffuseTex) actor.addTexture(ad.diffuseTex);
     if (ad.hasOpacity && ad.diffuseTex) {
       // VTK.js's automatic `opacity *= texture1.a` doesn't take effect here, so
-      // sample the alpha explicitly in the shader. forceTranslucent + depth
-      // peeling then blend knit gaps over the background.
+      // sample the alpha explicitly in the shader. forceTranslucent + OIT then
+      // blend knit gaps over the background (translucent, not alpha-test cutout).
       setShaderReplacements(mapper, OPACITY_ALPHA_SHADER);
       actor.setForceTranslucent(true);
     }
@@ -375,17 +401,14 @@ function populateNormal(renderer, actorsData, floorPD) {
     if (ad.hasNormalMap && ad.normalTex) {
       // Perturb the normal with the material's normal map (TBN from per-vertex
       // tangents), matching Python. normalTex packs the normal map in RGB and the
-      // opacity map in A; when there's opacity we read nmap.a and render translucent.
+      // opacity map in A; the opacity variant discards holes (alpha-test, opaque).
       mapper.setCustomShaderAttributes(['tangent']);
       setShaderReplacements(mapper, ad.hasOpacity ? NORMAL_MAP_OPACITY_SHADER : NORMAL_MAP_SHADER);
       actor.addTexture(ad.normalTex);
-      if (ad.hasOpacity) actor.setForceTranslucent(true);
     } else if (ad.hasOpacity && ad.opacityTex) {
-      // Match Python: opacity drives the fragment alpha, rendered translucent with
-      // depth peeling (8 peels) so the web previews the Python normal G-buffer.
+      // Opacity, no normal map: alpha-test cutout (opaque), not translucent.
       setShaderReplacements(mapper, NORMAL_OPACITY_SHADER);
       actor.addTexture(ad.opacityTex);
-      actor.setForceTranslucent(true);
     } else {
       setShaderReplacements(mapper, NORMAL_SHADER);
     }
@@ -430,8 +453,8 @@ function populateRoughness(renderer, actorsData, floorPD) {
     const opTex = ad.hasOpacity ? (ad.roughnessTex || ad.opacityTex) : ad.roughnessTex;
     if (opTex) actor.addTexture(opTex);
     if (ad.hasOpacity && opTex) {
-      setShaderReplacements(mapper, OPACITY_ALPHA_SHADER);
-      actor.setForceTranslucent(true);
+      // Alpha-test cutout (opaque), not translucent — see OPACITY_DISCARD_SHADER.
+      setShaderReplacements(mapper, OPACITY_DISCARD_SHADER);
     }
     renderer.addActor(actor);
   }
