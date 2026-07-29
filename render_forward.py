@@ -1,10 +1,10 @@
 """Forward-render G-buffer PNGs with the diffusion renderer.
 
 Usage:
-    python render_forward.py tmp/garment/
-    python render_forward.py tmp/garment/ --mode rotate-light
-    python render_forward.py tmp/garment/ --hdr examples/hdri/pink_sunrise_1k.hdr
-    python render_forward.py tmp/garment/ --num-samples 10 --seed 42
+    python render_forward.py output/250000_coat/
+    python render_forward.py output/250000_coat/ --mode rotate-light
+    python render_forward.py output/250000_coat/ --hdr examples/hdri/pink_sunrise_1k.hdr
+    python render_forward.py output/250000_coat/ --num-samples 10 --seed 42
 """
 
 import argparse
@@ -65,7 +65,7 @@ def load_gbuffers(input_dir, resolution=None):
 def main():
     parser = argparse.ArgumentParser(description="Forward-render G-buffer PNGs with the diffusion renderer.")
     parser.add_argument("input_dir", type=str, help="Directory containing G-buffer PNGs (basecolor, normal, depth, roughness, metallic). Missing buffers are zero-filled.")
-    parser.add_argument("--output", type=str, default="output", help="Output directory (default: tmp/<stem>/)")
+    parser.add_argument("--output", type=str, default="output", help="Output root directory; files go to <output>/<stem>/")
     parser.add_argument("--hdr", type=str, default="examples/hdri/sunny_vondelpark_1k.hdr", help="HDR environment map")
     parser.add_argument("--mode", choices=["still", "rotate-light"], default="still",
                         help="still: single image | rotate-light: light rotates 360°")

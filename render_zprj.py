@@ -169,7 +169,7 @@ def main():
     parser = argparse.ArgumentParser(description="Render a .zprj garment with the diffusion renderer.")
     parser.add_argument("input", type=str, help="Path to .zprj file")
     parser.add_argument("--hdr", type=str, default="examples/hdri/sunny_vondelpark_1k.hdr", help="HDR environment map")
-    parser.add_argument("--output", type=str, default="output", help="Output directory (default: tmp/<stem>/)")
+    parser.add_argument("--output", type=str, default="output", help="Output root directory; files go to <output>/<stem>/")
     parser.add_argument("--resolution", type=int, nargs="+", default=[704, 1280],
                         help="Render resolution (H W or single value for square)")
     parser.add_argument("--fov", type=float, default=10.0, help="Camera FOV in degrees")

@@ -4,9 +4,9 @@ Renders garment patterns, avatar, trims, buttons, and zippers.
 Output is compatible with render_forward.py.
 
 Usage:
-    python export_gbuffers.py samples/garment.zprj
-    python export_gbuffers.py samples/garment.zprj --output tmp/gbuffers/
-    python export_gbuffers.py samples/garment.zprj --resolution 1024
+    python export_gbuffers.py samples/250000_coat.zprj
+    python export_gbuffers.py samples/250000_coat.zprj --output output/gbuffers/
+    python export_gbuffers.py samples/250000_coat.zprj --resolution 1024
 """
 
 import argparse
@@ -20,7 +20,7 @@ from utils.utils_render_vtk import render_gbuffers
 def main():
     parser = argparse.ArgumentParser(description="Export G-buffer PNGs from a .zprj file.")
     parser.add_argument("zprj_file", help="Path to .zprj file")
-    parser.add_argument("--output", type=str, default=None, help="Output directory (default: tmp/<stem>/)")
+    parser.add_argument("--output", type=str, default=None, help="Output directory (default: output/<stem>/)")
     parser.add_argument("--resolution", type=int, default=512)
     parser.add_argument("--fov", type=float, default=15.0)
     parser.add_argument("--azimuth", type=float, default=0.0, help="Camera azimuth in degrees")
@@ -28,7 +28,7 @@ def main():
     args = parser.parse_args()
 
     stem = os.path.splitext(os.path.basename(args.zprj_file))[0]
-    out_dir = args.output or f"tmp/{stem}"
+    out_dir = args.output or f"output/{stem}"
     os.makedirs(out_dir, exist_ok=True)
 
     print(f"Loading {args.zprj_file} ...")
